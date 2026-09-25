@@ -481,6 +481,15 @@ class Client:
                 if config:
                     env['CLAUDE_CONFIG_DIR'] = config
                 env.pop('CLAUDE_CODE_EXTRA_BODY', None)
+                # FORK: never let a Hermes-managed token leak into native's own auth resolution.
+                # Hermes's other providers/credential pool set CLAUDE_CODE_OAUTH_TOKEN in os.environ
+                # for their own purposes; native prioritizes that env var over its keychain/file
+                # credential, so an unrelated (or stale/rotated) Hermes-side token silently hijacks
+                # this provider's auth and fails org verification with a native error that gives no
+                # hint why ("Unable to verify organization ... token could not be validated").
+                # Confirmed live: injecting a bogus value reproduces that exact failure byte for
+                # byte; stripping it restores native's normal keychain-based resolution. See FORK.md.
+                env.pop('CLAUDE_CODE_OAUTH_TOKEN', None)
                 env.update(ENABLE_TOOL_SEARCH='false', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1', CLAUDE_CODE_MAX_RETRIES='0', DISABLE_AUTO_COMPACT='1', DISABLE_COMPACT='1')
                 # Hermes owns budgets; native's replayed reminder invalidates cached history.
                 env['CLAUDE_CODE_TOTAL_TOKENS_REMINDER'] = 'off'

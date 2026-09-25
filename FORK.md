@@ -124,38 +124,82 @@ instance's URL at `claude`'s `HEAD .../api/hello` — before the fix, no
 logging, since removed) the relay forwards it and returns the real
 upstream's `200` back to native.
 
-**Still open — the enterprise-org failure is NOT fixed by this, and does
-not reproduce outside the live `hermes` process:**
-- With this fix live, `/api/hello` demonstrably succeeds (native receives a
-  real `200`), but `hermes -z "..." --provider
-  claude-subscription-directsdk-experimental -m claude-sonnet-5 --cli`
-  still fails with the exact same "Unable to verify organization" text.
-  Native never reaches `do_POST` at all after `/api/hello` succeeds (traced
-  with temporary per-request-path logging) — so whatever it checks next
-  fails silently on native's side, with nothing else hitting this server.
-- Extensive manual reproduction attempts, run outside hermes entirely with
-  a hand-built standalone `Admission` instance, using the *exact* captured
-  command array, env vars, and even the *exact* per-request `system.md` /
-  `settings.json` / `tools.json` files copied out of a live failing hermes
-  run before their tempdir was cleaned up (title-generation aux call,
-  confirmed by the `output_config.format.type: json_schema` in the captured
-  `CLAUDE_CODE_EXTRA_BODY`) — all succeeded normally, including with the
-  `[1m]` model suffix and two concurrent invocations fired at once. None of
-  these reproduced the failure in isolation.
-- The one env difference observed and not yet explained: the real hermes
-  invocation runs as a Bash-tool child of an *already-running* Claude Code
-  session, and inherits that session's full env (`CLAUDECODE=1`,
-  `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_SESSION_ID`,
-  `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_PID`, `CLAUDE_CONFIG_DIR` pointed
-  at a non-default profile dir, etc.) — none of which this fork's manual
-  repro attempts had set. Whether one of those inherited vars is what native
-  actually keys its org-verification on (rather than anything the loopback
-  relay sees) is untested and is the next thing to try: replay the exact
-  captured command/files again, but from *inside* a live Claude Code
-  session's own Bash tool (inheriting that ambient env) rather than a plain
-  interactive shell.
-- Given this, treat the enterprise-org-pinned-login case as **known broken,
-  cause not fully isolated** — not merely "not yet fixed." Reporting
-  upstream is still worthwhile (this fork's improved stderr message is
-  better repro evidence than anything available before), but don't assume
-  fixing `/api/hello` alone will resolve a report of this symptom.
+**Note:** this fix alone did NOT resolve the enterprise-org-pinned-login
+failure — see the next entry for the actual cause and fix. Isolating that
+required ruling out a lot of dead ends first (gateway staleness, ambient
+session env, concurrency); the trail is kept below since it's what actually
+proved this fix, on its own, was insufficient.
+
+## Fork-only fix — 2026-09-25 (a Hermes-managed CLAUDE_CODE_OAUTH_TOKEN was leaking into native's env, hijacking its auth)
+
+**Symptom:** even with both fixes above live, `hermes -z "..." --provider
+claude-subscription-directsdk-experimental -m claude-sonnet-5 --cli` still
+failed with the identical "Unable to verify organization" text — and native
+never reached `do_POST` at all after `/api/hello` succeeded (traced with
+temporary per-request-path logging on the relay), so whatever it checked
+next failed silently, with nothing else hitting this server.
+
+**Dead ends ruled out, in order (kept here so they aren't re-walked):**
+1. **Gateway staleness.** `hermes -z` doesn't spawn a fresh process — it
+   dispatches to the persistent gateway daemon (`ai.hermes.gateway`,
+   launchd-managed). That daemon had been running 5 days uninterrupted;
+   `hermes gateway restart` gave it a completely fresh process and the
+   failure was identical afterward. Not staleness.
+2. **Manual reproduction outside hermes, exhaustively.** A hand-built
+   standalone `Admission` instance, fed the *exact* captured command array,
+   env vars, and even the *exact* per-request `system.md` / `settings.json`
+   / `tools.json` files copied out of a live failing hermes run before their
+   tempdir was cleaned up (a title-generation aux call, identifiable by
+   `output_config.format.type: json_schema` in the captured
+   `CLAUDE_CODE_EXTRA_BODY`) — succeeded normally every time, including with
+   the `[1m]` model suffix and two concurrent invocations fired at once.
+   This ruled out the request shape, the flags, and concurrency, and pointed
+   at something about the *calling process's own environment* that these
+   manual replays weren't reproducing.
+3. **The actual difference:** the real hermes-driven native process runs
+   with `CLAUDE_CODE_OAUTH_TOKEN` present in its environment; every manual
+   repro (a plain interactive shell) had no such variable at all. Confirmed
+   by injecting an obviously-invalid dummy value
+   (`CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-obviously-invalid-...`) into an
+   otherwise-successful manual repro: it reproduced the exact "Unable to
+   verify organization ... token could not be validated" failure, verbatim.
+   `unset`-ing it again restored a normal, successful response.
+
+**Root cause:** native `claude` prioritizes the `CLAUDE_CODE_OAUTH_TOKEN`
+environment variable over its own keychain/file-stored credential when
+resolving auth. Hermes sets this variable in its own process environment
+for reasons unrelated to this plugin (its credential pool / other
+providers' OAuth handling), and because `Client._run()` builds native's env
+from a copy of `os.environ` (`self.env is None` path), that value leaked
+straight through into every native invocation this plugin makes — silently
+overriding the "let native use its own login" behavior the whole plugin is
+built around. Whatever token Hermes had cached there did not validate for
+the account's pinned enterprise org (stale, wrong scope, or simply a
+different credential than the one `claude auth login` established
+directly) — hence the failure. This is exactly the class of bug the
+existing `conflicts = [...]` check a few lines up already guards against
+(`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, the Bedrock/Vertex/Foundry
+flags) — that check just didn't include this variable.
+
+**Fix:** `directsdk.py`, `Client._run()`: unconditionally
+`env.pop('CLAUDE_CODE_OAUTH_TOKEN', None)` right after the existing
+`CLAUDE_CODE_EXTRA_BODY` pop, before any of the `env.update(...)` calls.
+Stripped rather than added to the `conflicts` error list (unlike the
+existing checks): those existing checks reject state a user deliberately
+set for a *different* provider; this variable is Hermes' own incidental
+plumbing that the user never asked this provider to honor, so silently
+removing it (letting native fall back to its normal keychain resolution,
+which is the whole point of this plugin) is the correct behavior, not an
+error.
+
+**Verification:** full suite green (31 passed). Live, through the actual
+gateway and CLI end to end: `hermes -z "say hi in exactly 3 words"
+--provider claude-subscription-directsdk-experimental -m claude-sonnet-5
+--cli` → `"Hey there, friend!"` — a real completed turn, on the enterprise-
+org-pinned login that had failed every single time before this fix.
+
+**Status: resolved.** The plugin now works against an enterprise-org-pinned
+Claude Code login. Worth reporting upstream regardless — any Hermes user
+who has ever had a `claude`/Claude Code login adopted into Hermes's
+credential pool (`auth.adopt_external_logins`, default on) is exposed to
+the same leak, org-pinned or not.
