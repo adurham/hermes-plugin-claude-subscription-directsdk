@@ -455,6 +455,7 @@ class Client:
     def _run(self, request, kwargs, body, manifest, names, system, frames):
         p = None
         reader = None
+        stderr_reader = None
         try:
             timeout = kwargs.get('timeout', self.timeout)
             timeout = getattr(timeout, 'read', timeout)
@@ -494,8 +495,15 @@ class Client:
                     env['CLAUDE_CODE_MAX_OUTPUT_TOKENS'] = str(json.loads(body)['max_tokens'])
                 # The resolved path matters on Windows: CreateProcess finds claude.exe on PATH but not the npm claude.cmd shim.
                 command = resolved + ['-p', '--model', native_model(kwargs['model']), '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--tools', '', '--system-prompt-file', str(root / 'system.md'), '--settings', str(root / 'settings.json'), '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--max-turns', '1', '--permission-mode', 'dontAsk', '--no-session-persistence', '--mcp-config', json.dumps(mcp)]
-                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding='utf-8', cwd=self._workdir(), env=env)
+                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', cwd=self._workdir(), env=env)
                 events = queue.Queue()
+                # FORK: native's stderr used to be discarded (subprocess.DEVNULL), so every
+                # startup/preflight failure (bad flag, org-verification failure, missing config)
+                # surfaced only as the generic "Incomplete native response" below, with no way to
+                # tell one cause from another. Capture a bounded tail on its own thread instead —
+                # nothing else drains this pipe, and a chatty native process could otherwise fill
+                # the OS pipe buffer and deadlock the write end. See FORK.md.
+                stderr_tail = []
                 def read():
                     try:
                         for line in p.stdout:
@@ -507,8 +515,21 @@ class Client:
                         # Reaping belongs to this owner thread, never cancel().
                         p.wait()
                         events.put(None)
+                def read_stderr():
+                    try:
+                        for line in p.stderr:
+                            stderr_tail.append(line)
+                            if len(stderr_tail) > 200:
+                                del stderr_tail[:len(stderr_tail) - 200]
+                    except Exception:
+                        pass
+                def stderr_suffix():
+                    text = ''.join(stderr_tail).strip()
+                    return f' | native stderr: {text[-2000:]}' if text else ''
                 reader = threading.Thread(target=read, daemon=True)
                 reader.start()
+                stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+                stderr_reader.start()
                 deadline = time.monotonic() + timeout
                 def receive():
                     nonlocal deadline
@@ -524,7 +545,7 @@ class Client:
                             continue
                         if isinstance(event, Exception):
                             # The offending stdout line is the whole diagnosis (a shim banner, a stray print); keep it.
-                            raise RuntimeError('Invalid native stream-json output: ' + repr((getattr(event, 'doc', None) or str(event))[:300])) from event
+                            raise RuntimeError('Invalid native stream-json output: ' + repr((getattr(event, 'doc', None) or str(event))[:300]) + stderr_suffix()) from event
                         deadline = time.monotonic() + timeout
                         return event
                 for index, frame in enumerate(frames):
@@ -570,6 +591,7 @@ class Client:
                             yield self._chunk(kwargs['model'], {'reasoning_content': delta['thinking']})
                 p.wait(timeout=max(.1, deadline-time.monotonic()))
                 reader.join(timeout=1)
+                stderr_reader.join(timeout=1)
                 if request.cancelled.is_set():
                     raise RuntimeError('Claude request cancelled')
                 admission = request.admission
@@ -589,7 +611,7 @@ class Client:
                         raise ClaudeCodeLoggedOut(f'{LOGGED_OUT_HINT} (native: {native_error})')
                     raise RuntimeError('Native API error: ' + native_error)
                 if len(results) != 1 or not assistants or not stopped:
-                    raise RuntimeError('Incomplete native response: assistant, message_stop and one result required')
+                    raise RuntimeError('Incomplete native response: assistant, message_stop and one result required' + stderr_suffix())
                 final = results[0]
                 blocks = [b for a in assistants for b in a['content']]
                 calls = []
@@ -601,7 +623,7 @@ class Client:
                         calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name[len(PREFIX):], 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and p.returncode == 1
                 if not boundary and not native_failure_handled and (p.returncode != 0 or final.get('is_error') or final.get('subtype') != 'success'):
-                    raise RuntimeError('Native request failed: ' + str(final.get('subtype')))
+                    raise RuntimeError('Native request failed: ' + str(final.get('subtype')) + stderr_suffix())
                 usage = assistants[0]['usage'] if admission.used else final.get('usage')
                 if not isinstance(usage, dict) or not all(isinstance(usage.get(k), (int, float)) for k in ('input_tokens', 'output_tokens')):
                     raise RuntimeError('Native result missing complete token usage')
@@ -633,7 +655,9 @@ class Client:
                 p.wait(timeout=5)
                 if reader is not None:
                     reader.join(timeout=5)
-                for pipe in (p.stdin, p.stdout):
+                if stderr_reader is not None:
+                    stderr_reader.join(timeout=5)
+                for pipe in (p.stdin, p.stdout, p.stderr):
                     if pipe and not pipe.closed:
                         pipe.close()
             with self._lock:
