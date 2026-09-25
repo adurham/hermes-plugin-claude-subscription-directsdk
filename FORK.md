@@ -39,17 +39,13 @@ Try again, or run: claude auth login
 
 Confirmed this is not a token/network/org problem in general — a plain
 `claude -p "say hi"` outside the plugin, same login, same machine, answers
-normally. It is specific to how the plugin invokes native: `ANTHROPIC_BASE_URL`
-is redirected to a per-request loopback admission relay
-(`http://127.0.0.1:<port>`, see `admission.py`) so the plugin can single-
-admission-gate the one real upstream call. On an org-pinned enterprise
-login, native does an extra org-verification handshake before the real
-turn; that preflight request also gets redirected to the loopback relay,
-which only knows how to proxy the one `/v1/messages` call — so the
-verification can't complete and native refuses outright, before any real
-inference is attempted. (The relay-vs-org-verification conflict itself is
-NOT fixed by this patch — see "Still open" below. This patch only stops
-the resulting error from being silently swallowed.)
+normally. It IS specific to how the plugin invokes native (redirecting
+`ANTHROPIC_BASE_URL` to a per-request loopback admission relay), but the
+exact mechanism turned out to be more than one bug — see the 2026-09-25
+`/api/hello` entry below for the first one found this way, and its "Still
+open" section for what's left unexplained even after that fix. (This entry's
+patch only stops the error from being silently swallowed; it does not fix
+the underlying failure by itself.)
 
 **Fix:** `directsdk.py`, `Client._run()`:
 - `stderr=subprocess.DEVNULL` → `stderr=subprocess.PIPE` on the native
@@ -77,13 +73,89 @@ suite green (see the dated result below). Live repro:
 real native stderr text (the org-verification failure above) appended to
 the same message.
 
-**Still open:** the underlying org-verification-vs-loopback-relay conflict
-itself is not fixed here — this plugin cannot currently complete a request
-against an enterprise-org-pinned Claude Code login at all (any relay-routed
-env would hit the same preflight). That needs the relay (`admission.py`) to
-either pass the org-verification call through to the real Anthropic API
-untouched, or have native skip that preflight when
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (already set by this client)
-covers it. Worth reporting upstream with this fork's improved error text as
-the repro evidence. A personal (non-org-pinned) Pro/Max login is not known
-to hit this — untested here, no such login available on this machine.
+**Still open:** the underlying failure itself is not fixed here — see the
+2026-09-25 `/api/hello` entry below for the deeper investigation this
+enabled (which found a real, separate bug, but did not fully explain this
+one).
+
+## Fork-only fix — 2026-09-25 (native's `/api/hello` liveness preflight had no handler at all)
+
+**Symptom:** using the stderr capture above to actually read native's
+diagnostic (rather than guessing from the generic "Incomplete native
+response" text), the enterprise-org-pinned-login failure said:
+
+```
+Unable to verify organization for the current authentication token.
+This machine requires organization <org-id> but the token could not be
+validated. This may be a network error, or the token may have been revoked.
+```
+
+**Root cause found (real, but see "Still open" — it does not fully explain
+the symptom above):** `admission.py`'s `Handler` only ever implemented
+`do_POST`, and only for the exact gated `/v1/messages` route — every other
+method/path fell through to `BaseHTTPRequestHandler`'s default (501
+Unsupported method). Traced natives's actual wire traffic with a throwaway
+logging loopback server (`ANTHROPIC_BASE_URL` pointed at a plain Python
+`http.server` that logs and 404s everything): before its real turn, native
+issues an unauthenticated `HEAD <base>/api/hello` — a separate, distinct
+request from a Bun-runtime helper (`User-Agent: Bun/x.y.z`), unlike the
+main Node/Stainless request path. Confirmed the real endpoint answers this
+unauthenticated (`curl -I https://api.anthropic.com/api/hello` → plain
+`200`). Against the admission relay, this HEAD got the 501, which is
+indistinguishable from a genuine network failure — plausibly why native's
+message hedges "may be a network error, or the token may have been
+revoked."
+
+**Fix:** `admission.py`, `Handler`:
+- New `_passthrough()`: forwards any request outside the gated `/v1/messages`
+  POST straight to the real upstream, unmodified — no capture, no
+  single-admission consumption, same Origin-header rejection as the gated
+  route (defense against a browser hitting this loopback port cross-origin).
+- `do_HEAD`/`do_GET`/`do_PUT`/`do_PATCH`/`do_DELETE`/`do_OPTIONS` all route
+  to `_passthrough()`.
+- `do_POST`'s path-mismatch branch now calls `_passthrough()` instead of
+  `send_error(404)` (the Origin-header check still always 404s, checked
+  first, unconditionally on path).
+
+**Verification:** full suite green (`PYTHONPATH=~/repos/hermes-agent pytest
+tests/ -q`, 31 passed). Live: pointed a real, standalone `Admission`
+instance's URL at `claude`'s `HEAD .../api/hello` — before the fix, no
+`do_HEAD` existed so this always 501'd; after, confirmed (via temporary
+logging, since removed) the relay forwards it and returns the real
+upstream's `200` back to native.
+
+**Still open — the enterprise-org failure is NOT fixed by this, and does
+not reproduce outside the live `hermes` process:**
+- With this fix live, `/api/hello` demonstrably succeeds (native receives a
+  real `200`), but `hermes -z "..." --provider
+  claude-subscription-directsdk-experimental -m claude-sonnet-5 --cli`
+  still fails with the exact same "Unable to verify organization" text.
+  Native never reaches `do_POST` at all after `/api/hello` succeeds (traced
+  with temporary per-request-path logging) — so whatever it checks next
+  fails silently on native's side, with nothing else hitting this server.
+- Extensive manual reproduction attempts, run outside hermes entirely with
+  a hand-built standalone `Admission` instance, using the *exact* captured
+  command array, env vars, and even the *exact* per-request `system.md` /
+  `settings.json` / `tools.json` files copied out of a live failing hermes
+  run before their tempdir was cleaned up (title-generation aux call,
+  confirmed by the `output_config.format.type: json_schema` in the captured
+  `CLAUDE_CODE_EXTRA_BODY`) — all succeeded normally, including with the
+  `[1m]` model suffix and two concurrent invocations fired at once. None of
+  these reproduced the failure in isolation.
+- The one env difference observed and not yet explained: the real hermes
+  invocation runs as a Bash-tool child of an *already-running* Claude Code
+  session, and inherits that session's full env (`CLAUDECODE=1`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_SESSION_ID`,
+  `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_PID`, `CLAUDE_CONFIG_DIR` pointed
+  at a non-default profile dir, etc.) — none of which this fork's manual
+  repro attempts had set. Whether one of those inherited vars is what native
+  actually keys its org-verification on (rather than anything the loopback
+  relay sees) is untested and is the next thing to try: replay the exact
+  captured command/files again, but from *inside* a live Claude Code
+  session's own Bash tool (inheriting that ambient env) rather than a plain
+  interactive shell.
+- Given this, treat the enterprise-org-pinned-login case as **known broken,
+  cause not fully isolated** — not merely "not yet fixed." Reporting
+  upstream is still worthwhile (this fork's improved stderr message is
+  better repro evidence than anything available before), but don't assume
+  fixing `/api/hello` alone will resolve a report of this symptom.

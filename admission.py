@@ -182,11 +182,72 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # Native authorization and the per-call route must never enter logs.
 
+    def _passthrough(self):
+        """Forward a request outside the gated /v1/messages route straight to the real upstream,
+        unmodified -- no capture, no single-admission consumption. FORK: native issues an
+        unauthenticated liveness preflight (``HEAD <base>/api/hello``, a separate Bun-runtime
+        helper distinct from the main Node/Stainless request path) before its real turn. This
+        server had no do_HEAD/do_GET at all, so BaseHTTPRequestHandler's default (501 Unsupported
+        method) is what native saw -- indistinguishable from a genuine network failure, so native
+        refused with 'Unable to verify organization ... may be a network error' before ever
+        attempting /v1/messages. Confirmed live: the real endpoint answers this preflight with a
+        plain unauthenticated 200 (curl -I https://api.anthropic.com/api/hello), so a bare
+        passthrough is sufficient -- no auth/gating logic applies to it. See FORK.md."""
+        if self.headers.get('Origin'):
+            self.send_error(404)
+            return
+        gate = self.server.admission
+        target = gate.upstream
+        conn = None
+        try:
+            length = int(self.headers.get('Content-Length', 0) or 0)
+            payload = self.rfile.read(length) if length else None
+            if target.scheme == 'https':
+                conn = http.client.HTTPSConnection(target.hostname, target.port, timeout=gate.timeout, context=ssl.create_default_context())
+            else:
+                conn = http.client.HTTPConnection(target.hostname, target.port, timeout=gate.timeout)
+            conn.connect()
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in ('host', 'connection', 'content-length', 'transfer-encoding', 'proxy-authorization', 'proxy-connection', 'accept-encoding')}
+            headers['Accept-Encoding'] = 'identity'
+            path = urlsplit(self.path)
+            gate_prefix_len = len(gate.prefix) if path.path.startswith(gate.prefix) else 0
+            route = target.path.rstrip('/') + path.path[gate_prefix_len:] + ('?' + path.query if path.query else '')
+            conn.request(self.command, route, payload, headers)
+            response = conn.getresponse()
+            self.send_response(response.status)
+            for key, value in response.getheaders():
+                if key.lower() not in ('connection', 'transfer-encoding', 'server', 'date'):
+                    self.send_header(key, value)
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            while True:
+                chunk = response.read1(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError):
+            self.send_error(502)
+        finally:
+            if conn:
+                conn.close()
+            self.close_connection = True
+
+    def do_HEAD(self): self._passthrough()
+    def do_GET(self): self._passthrough()
+    def do_PUT(self): self._passthrough()
+    def do_PATCH(self): self._passthrough()
+    def do_DELETE(self): self._passthrough()
+    def do_OPTIONS(self): self._passthrough()
+
     def do_POST(self):
         gate = self.server.admission
         path = urlsplit(self.path)
-        if path.path != gate.prefix + '/v1/messages' or self.headers.get('Origin'):
+        if self.headers.get('Origin'):
             self.send_error(404)
+            return
+        if path.path != gate.prefix + '/v1/messages':
+            self._passthrough()
             return
         with gate.lock:
             if gate.cancelled or gate.used:
