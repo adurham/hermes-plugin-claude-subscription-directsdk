@@ -291,3 +291,25 @@ contract).
 reports `available: true, logged_in: true` with no install banner; and a real polaris turn in a
 clean env (no `.zshrc`, no exported `CLAUDE_CONFIG_DIR`) has native spawned with
 `CLAUDE_CONFIG_DIR=~/.claude-personal` — sourced from .env by the plugin itself.
+
+## Fork-only fix — 2026-09-25 (the transport too: Client._run read os.environ, not the plugin's .env)
+
+**Symptom:** even with the probes fixed, a clean-env turn (`env -i`, no `.zshrc`) spawned native
+with `CLAUDE_CONFIG_DIR=<unset>` and native answered from the WRONG login — "has no usable login"
+/ "Not logged in". Isolated repro: `Client(env=None)` (the host's request path) in a clean env.
+
+**Root cause:** `Client._run` built native's environment from `os.environ` when `self.env is None`,
+and the process env does not carry this plugin's own declared vars — they live in
+`$HERMES_HOME/.env`. So the config-dir pin never reached native on a headless launch; the turn
+worked only because an interactive shell exported `CLAUDE_CONFIG_DIR` itself.
+
+**Fix:** `Client._run` (and `Client.__init__`'s command lookup) use `directsdk_setup._env()`;
+`resolve_claude` is passed `None` when `self.env is None` so it resolves within the same env.
+An explicitly passed env dict stays authoritative, unchanged.
+
+**Verification:** regression test
+`tests/test_directsdk_discovery.py::test_declared_env_vars_work_without_being_in_the_process_env`
+(red without the fix, green with it) asserts `.env` -> `_env()` -> `_child_env` maps the pin onto
+`CLAUDE_CONFIG_DIR` and never leaks the plugin-owned var into native; full suite 33 passed. Live:
+clean-env `Client(env=None)` returns `pong`; real polaris in `env -i` (no `.zshrc`) answers
+`CLEAN-OK`; interactive shell answers `SHELL-OK2`.

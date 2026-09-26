@@ -95,3 +95,48 @@ def test_native_alias_metadata_is_bounded_and_never_claims_subscription_invoice(
         reported["native_cost"]["total_cost_usd"] = invalid
         cost = estimate_usage_cost("sonnet", normalize_usage(reported), provider=profile.name)
         assert cost.status == "unknown" and cost.amount_usd is None
+
+
+
+def test_declared_env_vars_work_without_being_in_the_process_env(tmp_path, monkeypatch):
+    """FORK: plugin.yaml:optional_env vars live in $HERMES_HOME/.env, not os.environ.
+
+    The setup/picker flows write CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND/_CONFIG_DIR into
+    $HERMES_HOME/.env, and nothing mirrors them into the process environment (verified live: a
+    non-interactive launch saw neither). Reading os.environ directly therefore made the plugin
+    report 'Claude Code is not installed' over a working install and hand native the DEFAULT
+    config dir instead of the pinned one -> native resolved the wrong login and every request
+    failed with 'Not logged in'. _env() must source them from .env with the real process env
+    overlaying, and an explicit env dict must stay authoritative.
+    """
+    from directsdk_setup import _child_env, _env, _resolve, setup_status
+
+    fake_home = tmp_path / 'hermes-home'
+    fake_home.mkdir()
+    pin = tmp_path / 'pinned-claude'
+    pin.write_text('#!/bin/sh\nexit 0\n')
+    pin.chmod(0o755)
+    login_dir = tmp_path / 'pinned-login'
+    login_dir.mkdir()
+    (fake_home / '.env').write_text(
+        'CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND=%s\n'
+        'CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR=%s\n' % (pin, login_dir), encoding='utf-8')
+    monkeypatch.setenv('HERMES_HOME', str(fake_home))
+    monkeypatch.delenv('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND', raising=False)
+    monkeypatch.delenv('CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR', raising=False)
+
+    env = _env()
+    assert env['CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND'] == str(pin)
+    assert env['CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR'] == str(login_dir)
+    # The pin reaches native as CLAUDE_CONFIG_DIR; the plugin-owned var itself must not leak through.
+    child = _child_env(env)
+    assert child['CLAUDE_CONFIG_DIR'] == str(login_dir)
+    assert 'CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR' not in child
+    # A daemon-like launch (no pins in the process env) still resolves the .env command.
+    assert _resolve(None, env) == [str(pin)]
+    assert setup_status(env=env)['available'] is True
+    # An explicit env dict with no pins and no PATH entry stays authoritative: no .env fall-through.
+    assert _resolve(None, {'PATH': str(tmp_path / 'nowhere')}) is None
+    # The host's request path constructs a bare Client whose _run resolves _env() itself.
+    from directsdk import Client
+    assert Client().env is None

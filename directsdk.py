@@ -22,11 +22,11 @@ from types import SimpleNamespace
 try:
     from .admission import Admission
     from .model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
-    from .directsdk_setup import INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude
+    from .directsdk_setup import INSTALL_HINT, LOGGED_OUT_HINT, _env as plugin_env, _resolve as resolve_claude
 except ImportError:
     from admission import Admission
     from model_catalog import accepts_thinking_disable, native_model, supports_adaptive_thinking
-    from directsdk_setup import INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude
+    from directsdk_setup import INSTALL_HINT, LOGGED_OUT_HINT, _env as plugin_env, _resolve as resolve_claude
 
 
 class ClaudeCodeMissing(RuntimeError):
@@ -376,7 +376,7 @@ class Client:
         self.api_key = 'external-process'
         self.base_url = 'process://claude-subscription-directsdk-experimental'
         self.env = dict(env) if env is not None else None
-        source_env = self.env if self.env is not None else os.environ
+        source_env = self.env if self.env is not None else plugin_env()
         command = command or source_env.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND') or 'claude'
         self.command = ([command] if isinstance(command, str) else list(command)) + list(args or [])
         self.timeout = timeout if isinstance(timeout, (int, float)) else 180
@@ -467,14 +467,17 @@ class Client:
                 root = Path(tmp)
                 (root / 'tools.json').write_text(json.dumps(manifest), encoding='utf-8')
                 mcp = {'mcpServers': {'hermes': {'command': sys.executable, 'args': [str(Path(__file__).with_name('inert_mcp.py')), str(root / 'tools.json')]}}}
-                env = _with_windows_essentials(dict(self.env if self.env is not None else os.environ))
+                # FORK: self.env is None on the host's request path, and the process env does not carry this
+                # plugin's own declared vars (they live in $HERMES_HOME/.env). Resolving native against a bare
+                # os.environ ran it with the WRONG login and reported the install hint over a working install.
+                env = _with_windows_essentials(dict(self.env) if self.env is not None else plugin_env())
                 if self.env is None:
                     conflicts = [key for key in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_FOUNDRY_API_KEY') if env.get(key)]
                     conflicts += [key for key in ('CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY') if env.get(key, '').lower() not in ('', '0', 'false', 'no', 'off')]
                     if conflicts:
                         raise ValueError('OAuth provider refuses conflicting native auth/backend overrides: ' + ', '.join(conflicts))
                 # Fail with the install hint, not a Popen FileNotFoundError, when Claude Code is absent.
-                resolved = resolve_claude(self.command, env)
+                resolved = resolve_claude(self.command, None if self.env is None else env)
                 if resolved is None:
                     raise ClaudeCodeMissing(INSTALL_HINT)
                 config = env.pop('CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR', None)
