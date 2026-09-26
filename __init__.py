@@ -7,13 +7,52 @@ from providers.base import ProviderProfile
 
 # Dual import: the Hermes loader imports this directory as a package; the flat test path does not.
 try:
+    from .directsdk import ClaudeCodeLoggedOut
     from .model_catalog import ALIASES, MODEL_METADATA, native_model
     from .directsdk_setup import INSTALL_HINT, _resolve
 except ImportError:
+    from directsdk import ClaudeCodeLoggedOut
     from model_catalog import ALIASES, MODEL_METADATA, native_model
     from directsdk_setup import INSTALL_HINT, _resolve
 
 logger = logging.getLogger(__name__)
+
+# Native's own words for a login that is gone for good. ``no usable login`` is the refusal raised
+# before any upstream request; ``could not be refreshed`` is native's own diagnosis appended to it.
+_DEAD_LOGIN_SIGNATURES = ('no usable login', 'could not be refreshed')
+# The transient sibling: another Claude Code process holds the refresh lock (a second CLI, or the
+# interactive one mid-rotation). Retrying really can work, so it must NOT take the terminal verdict.
+_REFRESH_RACE_SIGNATURE = 'another claude code process is refreshing'
+
+
+def classify_native_error(error, *, message='', **_):
+    """A login this provider cannot use is terminal, not an unclassifiable provider failure.
+
+    Core's pattern tables are HTTP-shaped: they carry no phrase for "the local CLI has no
+    credential", so the refusal fell through to the ``unknown`` catch-all and the user read
+    ``unavailable (provider failure)`` — the one label that names neither the cause nor the fix —
+    while every call burned the full retry budget before the fallback ran. Only this provider knows
+    what its own native error means, which is exactly what the profile hook is for
+    (``agent.error_classifier._profile_verdict``, scoped to the erroring provider).
+
+    ``ProviderProfile`` declares ``classify_api_error`` as a dataclass FIELD, so the hook must be
+    passed at construction (a subclass method of that name is shadowed by the field default).
+
+    The retryable sibling — ``another Claude Code process is refreshing it`` — is deliberately left
+    alone: it clears on its own, and a terminal verdict there would send a working login to the
+    fallback chain for the duration of someone else's refresh.
+    """
+    text = ' '.join(str(part) for part in (error, message) if part).lower()
+    if _REFRESH_RACE_SIGNATURE in text:
+        return None
+    if not isinstance(error, ClaudeCodeLoggedOut) and not any(sig in text for sig in _DEAD_LOGIN_SIGNATURES):
+        return None
+    # ``auth_permanent`` is the built-in terminal-credential verdict (same recovery as ``auth``):
+    # abort the retries, take the fallback chain, no credential rotation — there is no pool entry
+    # behind this provider and no other credential to rotate to.
+    return {'reason': 'auth_permanent', 'retryable': False, 'should_fallback': True,
+            'error_context': {'native_login_dead': True}}
+
 
 
 class ClaudeOAuthDirectSDKProfile(ProviderProfile):
@@ -94,6 +133,7 @@ profile = ClaudeOAuthDirectSDKProfile(
     default_aux_model='claude-sonnet-5[1m]',
     fallback_models=tuple(MODEL_METADATA),
     model_aliases={alias: native_model(alias) for alias in ALIASES},
+    classify_api_error=classify_native_error,
 )
 register_provider(profile)
 
