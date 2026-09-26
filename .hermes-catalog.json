@@ -1,0 +1,7 @@
+{
+  "catalog_name": "claude-subscription-directsdk",
+  "repo": "https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk",
+  "sha": "602393b6d3ea148bc618cd23da1a13fa332e1433",
+  "tier": "official",
+  "installed_at": "2026-09-25T17:34:06Z"
+}

@@ -203,3 +203,21 @@ Claude Code login. Worth reporting upstream regardless — any Hermes user
 who has ever had a `claude`/Claude Code login adopted into Hermes's
 credential pool (`auth.adopt_external_logins`, default on) is exposed to
 the same leak, org-pinned or not.
+
+## Fork-only fix — 2026-09-25 (the two replay errors now carry native stderr too)
+
+**Symptom:** the errors that actually kill every Hermes *retry* of a turn —
+`Native exited before replay acknowledgment` and `Native history replay not
+supported: expected zero-turn acknowledgment` — were the three-RuntimeError
+list's blind spot: they surfaced with no native-side diagnostic even after the
+stderr-capture commit, exactly when they matter most (a retry after a transient
+upstream failure, where the first attempt's error text is already known and the
+question is why the replay died).
+
+**Fix:** append `stderr_suffix()` to both raises (same bounded 200-line tail).
+
+**Why:** observed live — a 20:56 turn lost its first attempt to a relay→upstream
+`TimeoutError`, and both retries then died at "Native exited before replay
+acknowledgment" with nothing to read. The replay path is the one place native
+runs *before* any inference, so its exit reason is pure startup-state
+diagnosis (login/org/preflight) — precisely what must not be swallowed.

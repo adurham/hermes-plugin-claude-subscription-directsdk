@@ -567,10 +567,10 @@ class Client:
                         while True:
                             ack = receive()
                             if ack is None:
-                                raise RuntimeError('Native exited before replay acknowledgment')
+                                raise RuntimeError('Native exited before replay acknowledgment' + stderr_suffix())
                             if ack.get('type') == 'result':
                                 if ack.get('num_turns') != 0 or ack.get('is_error'):
-                                    raise RuntimeError('Native history replay not supported: expected zero-turn acknowledgment')
+                                    raise RuntimeError('Native history replay not supported: expected zero-turn acknowledgment' + stderr_suffix())
                                 break
                 p.stdin.close()
                 assistants, results, stopped, emitted = [], [], False, ''
