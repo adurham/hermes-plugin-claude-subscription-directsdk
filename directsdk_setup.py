@@ -26,7 +26,50 @@ LOGGED_OUT_HINT = ("Claude Code is installed but has no usable login in the envi
                    "or point CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR at a logged-in config directory, then try again.")
 
 
+def _env():
+    """The plugin's OWN declared variables, read from the user's .env at call time.
+
+    FORK: ``plugin.yaml:optional_env`` declares CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND and
+    CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR and the setup/picker flows write them into
+    ``$HERMES_HOME/.env`` — but nothing mirrors them into ``os.environ``. A non-interactive
+    launch therefore had neither pin: native resolved the wrong login (the "Not logged in"
+    cascade) and the import-time probe reported the install hint over a working install.
+    Real process env still wins, so an explicit override (and the picker's own interactive
+    ``os.environ`` assignments) behave exactly as before.
+    """
+    env = dict(_read_env_file())
+    env.update({k: v for k, v in os.environ.items() if v})
+    return env
+
+
+def _read_env_file():
+    """Minimal ``KEY=VALUE`` reader for ``$HERMES_HOME/.env`` (stdlib only, no imports)."""
+    import re
+    try:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / ".env"
+    except Exception:
+        path = os.path.join(os.path.expanduser("~"), ".hermes", ".env")
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip().strip("'" + '"')
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                    values[key] = value
+    except OSError:
+        pass
+    return values
+
+
 def _resolve(command, env):
+    """Resolve native. ``env=None`` (the plugin's own probes) reads .env + process env; an explicit
+    dict is authoritative and never consults the process environment (the flaky-gate contract)."""
+    env = dict(env) if env is not None else _env()
     command = list(command) if command else [env.get("CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND") or "claude"]
     head = command[0]
     exe = head if os.path.isabs(head) and os.access(head, os.X_OK) else shutil.which(head, path=env.get("PATH") or os.defpath)
@@ -52,7 +95,7 @@ def _plan_label(raw):
 
 def setup_status(command=None, env=None, timeout=20):
     """``{available, logged_in, plan, detail, login_command}`` from the CLI's own ``auth status``."""
-    env = dict(env if env is not None else os.environ)
+    env = dict(env) if env is not None else _env()
     resolved = _resolve(command, env)
     if resolved is None:
         return {"available": False, "logged_in": False, "plan": "", "detail": INSTALL_HINT, "login_command": None}
@@ -73,7 +116,7 @@ def setup_status(command=None, env=None, timeout=20):
 def discover_models(command=None, env=None, timeout=40):
     """The account's live picker as ``[{id, label, note, upstream_requests}]`` in Hermes route ids,
     or ``None`` when the CLI is missing, logged out, or the handshake fails."""
-    env = dict(env if env is not None else os.environ)
+    env = dict(env) if env is not None else _env()
     resolved = _resolve(command, env)
     # Logged out, the handshake still answers with a generic default list; only a signed-in
     # account's picker reflects its entitlements.

@@ -99,5 +99,5 @@ register_provider(profile)
 
 # The provider stays registered when Claude Code is missing so `hermes model` can show the
 # install hint; the request path (`directsdk.Client`) refuses with the same message.
-if _resolve(None, os.environ) is None:
+if _resolve(None, None) is None:
     logger.warning("%s: %s", profile.display_name, INSTALL_HINT)

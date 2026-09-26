@@ -263,3 +263,31 @@ one line with its type, no traceback. The gated `/v1/messages` path is unchanged
 **Verification:** new test `tests/test_directsdk_admission.py::test_client_disconnect_does_not_dump_a_traceback`
 — red without the fix (asserts on the captured `'-'*40` / traceback text), green with it; full
 suite 8 passed. Live: a real polaris turn through the plugin on the corp box.
+
+## Fork-only fix — 2026-09-25 (the plugin's own declared .env vars were invisible to it)
+
+**Symptom:** on a headless launch the plugin printed
+`Claude Code is not installed (no claude on PATH) … or set CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND`
+over a perfectly working install, and — worse — ran native against the wrong login (the
+"Not logged in" cascade), because neither `CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND` nor
+`CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR` was visible to it.
+
+**Root cause:** both are declared in `plugin.yaml:optional_env` and written by the setup/picker
+flows into `$HERMES_HOME/.env`, but **nothing mirrors them into the process environment**.
+Every probe in this plugin read `os.environ` directly, so on a non-interactive launch the pins
+did not exist: `_resolve(None, os.environ)` looked up bare `claude` on a PATH without
+`~/.local/bin` (the import-time install warning), and `_child_env` had no config dir to map
+onto `CLAUDE_CONFIG_DIR`, leaving native to its own default (`~/.claude`) instead of the login
+the user actually pinned. Interactive shells only worked because `.zshrc` exported
+`CLAUDE_CONFIG_DIR` itself — the plugin was working by accident.
+
+**Fix:** `directsdk_setup.py` gains `_env()` — a stdlib reader of `$HERMES_HOME/.env` (via
+`hermes_constants.get_hermes_home()`), overlaid by real process env so explicit overrides still
+win — and `setup_status` / `discover_models` / `__init__`'s import probe / `_resolve` default to
+it. An explicit env dict passed by a caller stays authoritative (the `test_resolve_honors…`
+contract).
+
+**Verification:** full suite 33 passed; minimal-env probe (`env -i`, PATH=/usr/bin:/bin) now
+reports `available: true, logged_in: true` with no install banner; and a real polaris turn in a
+clean env (no `.zshrc`, no exported `CLAUDE_CONFIG_DIR`) has native spawned with
+`CLAUDE_CONFIG_DIR=~/.claude-personal` — sourced from .env by the plugin itself.
