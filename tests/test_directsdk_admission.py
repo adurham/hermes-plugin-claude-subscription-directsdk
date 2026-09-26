@@ -159,3 +159,38 @@ def test_invalid_stream_json_error_names_the_offending_line(tmp_path):
             client.create(model='sonnet',messages=[{'role':'user','content':'fixture'}])
     finally:
         client.close()
+
+
+def test_client_disconnect_does_not_dump_a_traceback(capsys):
+    """FORK: a native disconnect mid-proxy must not print socketserver's traceback.
+
+    Native connects per request and hangs up as soon as it has what it needs. When that happens
+    while the relay is answering, the write raises BrokenPipeError out of the handler and
+    socketserver's default handle_error() dumps '-'*40 / 'Exception occurred during processing of
+    request from ...' / two tracebacks into the user's terminal (observed live on the corp box,
+    2026-09-25). The relay must stay silent for a client disconnect.
+    """
+    import socket
+    import time
+    from http.client import HTTPConnection
+    import admission
+    probe = socket.socket()
+    probe.bind(('127.0.0.1', 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()  # nothing listens here: _passthrough's connect() fails, so it answers send_error(502)
+    gate = admission.Admission(f'http://127.0.0.1:{dead_port}', 5)
+    try:
+        capsys.readouterr()  # drop anything printed before the exchange
+        conn = HTTPConnection('127.0.0.1', gate.server.server_port, timeout=5)
+        conn.connect()
+        conn.putrequest('HEAD', gate.prefix + '/api/hello')
+        conn.endheaders()
+        conn.sock.close()  # native hung up; the relay's 502 now writes to a dead peer
+        end = time.monotonic() + 4
+        while time.monotonic() < end:  # bounded: let the handler thread run and (pre-fix) print
+            time.sleep(0.05)
+        err = capsys.readouterr().err
+        assert 'Traceback' not in err, err
+        assert 'Exception occurred during processing of request' not in err, err
+    finally:
+        gate.close()

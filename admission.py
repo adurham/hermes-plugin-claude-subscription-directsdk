@@ -9,6 +9,7 @@ import re
 import secrets
 import socket
 import ssl
+import sys
 import threading
 from urllib.parse import urlsplit
 
@@ -181,6 +182,21 @@ class Admission:
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # Native authorization and the per-call route must never enter logs.
+
+    def handle_error(self, request, client_address):
+        """FORK: socketserver's default dumps a full traceback to stderr for ANY handler exception.
+
+        Native opens one connection per request and hangs up as soon as it has what it needs; when it
+        does so while this relay is mid-proxy, the reply write raises BrokenPipeError out of the
+        handler and the terminal the user is watching fills with socketserver's
+        ``'-'*40`` / ``Exception occurred during processing of request from ('127.0.0.1', ...)``
+        / two-traceback block (observed live). The relay's own classification (status, capture,
+        failure, denied) is what callers read; a client disconnect is not worth a stack dump.
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        print('claude-subscription-directsdk-experimental relay: ' + type(exc).__name__ if exc else 'relay error', file=sys.stderr)
 
     def _passthrough(self):
         """Forward a request outside the gated /v1/messages route straight to the real upstream,

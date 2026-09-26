@@ -221,3 +221,45 @@ question is why the replay died).
 acknowledgment" with nothing to read. The replay path is the one place native
 runs *before* any inference, so its exit reason is pure startup-state
 diagnosis (login/org/preflight) — precisely what must not be swallowed.
+
+## Fork-only fix — 2026-09-25 (a native disconnect dumped socketserver tracebacks into the CLI)
+
+**Symptom:** the user's polaris terminal filled with
+
+```
+──────── (x40)
+──────── (x40)
+Exception occurred during processing of request from ('127.0.0.1', 51015)
+Traceback (most recent call last):
+  File ".../admission.py", line 209, in _passthrough
+    conn.connect()
+  ...
+TimeoutError
+During handling of the above exception, another exception occurred:
+  File ".../admission.py", line 236, in do_HEAD
+    def do_HEAD(self): self._passthrough()
+  File ".../admission.py", line 230, in _passthrough
+    self.send_error(502)
+  ...
+BrokenPipeError: [Errno 32] Broken pipe
+```
+
+right next to the retry diagnostics — the relay's internal exception classes, two full
+tracebacks, and no way to tell whether anything actually went wrong.
+
+**Root cause:** `_passthrough()` (the `/api/hello` proxy added earlier today) writes its
+`send_error(502)` *inside* its `except` block, so when native has already hung up, that write
+raises BrokenPipeError and escapes the handler. `BaseHTTPRequestHandler` never overrode
+`handle_error`, so `socketserver`'s default ran: `'-'*40`, `'Exception occurred during
+processing of request from %s'`, and the full (chained) traceback to stderr — i.e. into the
+CLI the user is watching. Native opening one connection per request and closing it as soon as
+it has its answer makes this routine, not exceptional.
+
+**Fix:** `admission.py` — override `Handler.handle_error()`: a `BrokenPipeError` /
+`ConnectionResetError` (a client disconnect, which the relay already classifies via
+`status`/`capture`/`failure`/`denied`) returns silently; any other handler exception prints
+one line with its type, no traceback. The gated `/v1/messages` path is unchanged.
+
+**Verification:** new test `tests/test_directsdk_admission.py::test_client_disconnect_does_not_dump_a_traceback`
+— red without the fix (asserts on the captured `'-'*40` / traceback text), green with it; full
+suite 8 passed. Live: a real polaris turn through the plugin on the corp box.
