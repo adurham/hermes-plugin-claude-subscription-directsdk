@@ -36,11 +36,16 @@ window and which plans include it; the model table for the minimum CLI version).
    window from the docs. Do not copy a window from a sibling model.
 2. `ALIASES` — move the family alias (`opus`, `sonnet`, `fable`, `haiku`) when the docs move it.
 3. `MANDATORY_THINKING` / `NO_ADAPTIVE_THINKING` if the docs say thinking cannot be turned off
-   or adaptive thinking 400s (Fable and Haiku 4.5 today). Mirror what
-   `agent/anthropic_adapter.py` in hermes-agent encodes; if the two disagree, fix both. Open
-   question: the docs also say thinking cannot be turned off on Opus 5.5, but whether the API
-   400s the disable (as on Fable) or ignores it is unverified; probe before adding it to
-   `MANDATORY_THINKING`.
+   or adaptive thinking 400s (Fable, Haiku 4.5, Opus 5.5 and Sonnet 5.5 today). Mirror what
+   `agent/anthropic_adapter.py` in hermes-agent encodes; if the two disagree, fix both. Resolved
+   (2026-09-29): Opus 5.5's and Sonnet 5.5's docs both confirm the disable 400s
+   (`"thinking.type.disabled" is not supported for this model`), same as Fable — both are in
+   `MANDATORY_THINKING` using their exact canonical id, never a short family prefix (`claude-opus-5`
+   would also wrongly catch the OLD, still-disable-capable Opus 5). Sonnet 5.5 additionally exposes
+   a `between_tools` thinking type as a lower floor than `adaptive`; this repo does not model a
+   third thinking type (only `disabled` vs `adaptive`), so a caller asking for reasoning off on
+   Sonnet 5.5 lands on the model's default effort, not `between_tools` — a real but small
+   under-optimization, not a correctness bug, and a candidate follow-up if it matters in practice.
 4. `tests/test_directsdk_models.py::EXPECTED` — one row per route, window included. The test
    drives the fake CLI and checks the argv Hermes actually sends.
 5. `README.md` → Requirements: the minimum Claude Code version the model needs.

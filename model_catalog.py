@@ -1,5 +1,6 @@
 """Pinned native routes; a loopback gateway needs explicit long-context selection."""
 CONTEXT_WINDOWS = {
+    'claude-sonnet-5-5': 1_000_000,
     'claude-sonnet-5': 1_000_000,
     'claude-haiku-4-5-20251001': 200_000,
     'claude-opus-5-5': 1_000_000,
@@ -9,10 +10,14 @@ CONTEXT_WINDOWS = {
 }
 # Families that 400 on ``thinking: {"type": "disabled"}`` (the same contract Hermes core keeps
 # in agent/anthropic_adapter.py). A caller's disable is omitted for them: thinking stays on at
-# the model's default, which beats a dead request.
-MANDATORY_THINKING = ('claude-fable',)
+# the model's default, which beats a dead request. Opus 5.5 and Sonnet 5.5 both made thinking
+# mandatory (adaptive, controlled only by effort). Entries here must be the exact canonical id,
+# not a short family prefix: 'claude-opus-5' alone would also match itself (the OLD, non-5.5
+# Opus 5, which still accepts disabling thinking at effort high-or-below) — only the full
+# 'claude-opus-5-5' string is safe, since it cannot match the shorter 'claude-opus-5'.
+MANDATORY_THINKING = ('claude-fable', 'claude-opus-5-5', 'claude-sonnet-5-5')
 ALIASES = {
-    'sonnet': 'claude-sonnet-5',
+    'sonnet': 'claude-sonnet-5-5',
     'haiku': 'claude-haiku-4-5-20251001',
     'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
     'opus': 'claude-opus-5-5',
