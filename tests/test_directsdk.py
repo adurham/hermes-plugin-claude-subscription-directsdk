@@ -195,22 +195,26 @@ class Contract(unittest.TestCase):
     def test_fail_closed_and_cancellation(self):
         import directsdk
 
+        # claude-sonnet-5 (not 5.5) still accepts thinking:disabled; pin it explicitly rather than
+        # relying on the default "sonnet" alias, which now resolves to Sonnet 5.5 (mandatory thinking).
         disabled = json.loads(
             directsdk.request_body(
-                {**self.request(), "extra_body": {"reasoning": {"enabled": False}}}
+                {**self.request(), "model": "claude-sonnet-5", "extra_body": {"reasoning": {"enabled": False}}}
             )[0]
         )
         self.assertEqual(disabled["thinking"], {"type": "disabled"})
         self.assertEqual(disabled["context_management"], {"edits": []})
-        # Fable rejects the disable (HTTP 400 "thinking.type.disabled is not supported"), so a
-        # caller's disable is omitted rather than sent: thinking stays on, the request survives.
-        mandatory = json.loads(
-            directsdk.request_body(
-                {**self.request(), "model": "fable", "extra_body": {"reasoning": {"enabled": False}}}
-            )[0]
-        )
-        self.assertNotIn("thinking", mandatory)
-        self.assertNotIn("context_management", mandatory)
+        # Fable, Opus 5.5 and Sonnet 5.5 all reject the disable (HTTP 400 "thinking.type.disabled
+        # is not supported"), so a caller's disable is omitted rather than sent: thinking stays on,
+        # the request survives.
+        for mandatory_model in ("fable", "opus", "sonnet"):
+            mandatory = json.loads(
+                directsdk.request_body(
+                    {**self.request(), "model": mandatory_model, "extra_body": {"reasoning": {"enabled": False}}}
+                )[0]
+            )
+            self.assertNotIn("thinking", mandatory)
+            self.assertNotIn("context_management", mandatory)
         effort = json.loads(
             directsdk.request_body(
                 {**self.request(), "extra_body": {"reasoning": {"effort": "low"}}}
