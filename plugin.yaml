@@ -1,6 +1,6 @@
 name: claude-subscription-directsdk-experimental
 kind: model-provider
-version: 0.4.0
+version: 0.5.0
 manifest_version: 2
 description: Claude Subscription DirectSDK (Experimental) — drive your Claude Pro/Max subscription through the official Claude Code CLI; Hermes owns tools, approvals and compaction
 author: Nous Research
@@ -12,6 +12,7 @@ platforms: []
 optional_env:
   - CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND
   - CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR
+  - CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN
   - CLAUDE_CONFIG_DIR
 external_dependencies:
   - name: claude

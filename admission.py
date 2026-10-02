@@ -180,6 +180,14 @@ class Admission:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # FORK 2026-09-28: HTTP/1.0-with-forced-close on the /api/hello passthrough (see below)
+    # made native abort before ever attempting /v1/messages, specifically when auth is the
+    # plugin's own CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN static token (2026-09-27 addition)
+    # rather than native's own keychain session -- the keychain path tolerated it fine. See
+    # FORK.md's 2026-09-28 entry for the isolation (org-verification failure reproduced and
+    # fixed by restoring real HTTP/1.1 keep-alive semantics on the preflight leg alone).
+    protocol_version = 'HTTP/1.1'
+
     def log_message(self, *args):
         pass  # Native authorization and the per-call route must never enter logs.
 
@@ -232,9 +240,16 @@ class Handler(BaseHTTPRequestHandler):
             response = conn.getresponse()
             self.send_response(response.status)
             for key, value in response.getheaders():
-                if key.lower() not in ('connection', 'transfer-encoding', 'server', 'date'):
+                if key.lower() not in ('connection', 'transfer-encoding'):
                     self.send_header(key, value)
-            self.send_header('Connection', 'close')
+            # FORK 2026-09-28: real HTTP/1.1 keep-alive (real status line, real Content-Length,
+            # real Server/Date headers) when we can honor it -- a forced HTTP/1.0-style close
+            # here made native abort its /api/hello liveness check before ever reaching
+            # /v1/messages, for the static-token auth path specifically. Content-Length is what
+            # makes a keep-alive response unambiguous without also replicating chunked framing;
+            # falls back to the previous close-after-response behavior otherwise. See FORK.md.
+            keep_alive = response.getheader('Content-Length') is not None
+            self.send_header('Connection', 'keep-alive' if keep_alive else 'close')
             self.end_headers()
             while True:
                 chunk = response.read1(65536)
@@ -242,12 +257,13 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
+            self.close_connection = not keep_alive
         except (OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError):
             self.send_error(502)
+            self.close_connection = True
         finally:
             if conn:
                 conn.close()
-            self.close_connection = True
 
     def do_HEAD(self): self._passthrough()
     def do_GET(self): self._passthrough()

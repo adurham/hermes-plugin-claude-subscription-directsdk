@@ -313,3 +313,120 @@ An explicitly passed env dict stays authoritative, unchanged.
 `CLAUDE_CONFIG_DIR` and never leaks the plugin-owned var into native; full suite 33 passed. Live:
 clean-env `Client(env=None)` returns `pong`; real polaris in `env -i` (no `.zshrc`) answers
 `CLEAN-OK`; interactive shell answers `SHELL-OK2`.
+
+## Fork-only change — 2026-09-27 (opt-in static token, so the user can pin this provider to a `claude setup-token` instead of native's rotating keychain session)
+
+**Motivation:** the 2026-09-25 fix above is correct — an *accidental* leak of Hermes'
+pooled `CLAUDE_CODE_OAUTH_TOKEN` must never hijack this provider's auth. But the user
+independently hit the underlying keychain session going stale/revoked on its own (an
+enterprise-org-pinned Claude Code login, refresh-token rotation) enough times that they
+wanted this provider pinned to a long-lived (1-year) `claude setup-token` on purpose,
+not native's normal session. The existing strip gives no way to do that deliberately.
+
+**Fix:** `directsdk.py`, `Client._run()`: before the existing unconditional
+`env.pop('CLAUDE_CODE_OAUTH_TOKEN', None)`, pop a new, plugin-owned
+`CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN` var (declared in `plugin.yaml:optional_env`,
+same trust tier as `_COMMAND`/`_CONFIG_DIR`, read only via `directsdk_setup._env()` —
+never picked up from ambient `os.environ` by accident). If present, it's written back in
+as `CLAUDE_CODE_OAUTH_TOKEN` for native's spawn only, after the generic pool var has
+already been stripped. This can't reopen the 2026-09-25 leak: that bug was Hermes'
+*unrelated* pool value showing up unasked-for; this is a value the user explicitly put
+in this plugin's own `.env` entry for this plugin to use.
+
+**Verification:** full suite green (33 passed, unchanged — no existing test sets
+`CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN`, so this is additive). Not yet covered by a
+dedicated regression test — worth adding
+`test_static_token_var_overrides_stripped_pool_token` if this sees continued use.
+
+## Fork-only finding — 2026-09-28 (the static-token path cannot survive the `ANTHROPIC_BASE_URL` redirect at all; not fixable in this plugin)
+
+**Symptom:** `CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN` (the 2026-09-27 feature above) started
+failing with the same "Unable to verify organization ... token could not be validated" text,
+on the same enterprise-org-pinned login this plugin already works against via the normal
+keychain session. `claude --version` shows an unrelated same-day auto-update (2.1.283 ->
+2.1.284, `~/.claude-personal/.last-update-result.json` timestamp matches) that looked like the
+obvious suspect and was not.
+
+**Ruled out, in order (full isolation, each confirmed live):**
+1. Token staleness/leak — a bare `CLAUDE_CODE_OAUTH_TOKEN=<the static token> claude -p "hi"`,
+   no relay, always succeeds. The token itself is valid.
+2. The CLI version bump — the *previous*, already-verified-working 2.1.283 binary reproduces
+   the identical failure through the relay. Not a 2.1.284 regression.
+3. `admission.py`'s header stripping (`server`/`date` excluded on the `/api/hello` passthrough)
+   — forwarding them unmodified made no difference.
+4. HTTP/1.0-forced-close on that passthrough — switching to real HTTP/1.1 keep-alive let native
+   occasionally get one step further (attempting `POST /v1/messages` instead of aborting right
+   after the preflight), but the *final* result was still the identical failure every time. This
+   was applied to `_passthrough()` (protocol_version='HTTP/1.1', keep-alive when Content-Length
+   is known) since it's a strictly more correct proxy implementation regardless, but note it did
+   **not** fix the reported problem — don't re-attempt this angle expecting a different outcome.
+5. Proxy fidelity in general — the relay's `/api/hello` response is byte-identical to the real
+   endpoint's, and native's own request headers for that preflight are byte-identical between
+   the working (keychain) and failing (static-token) cases (`Connection`, `User-Agent: Bun/x.y.z`,
+   `Accept`, `Host`, `Accept-Encoding` — nothing else). No proxy-visible signal explains the
+   divergence.
+
+**Root cause found:** native opens a second, *separate* TLS connection straight to
+`api.anthropic.com`'s real IP (confirmed via `lsof -p <native-pid> -i TCP` during a live failing
+run: `TCP [...]->[2607:6bc0::10]:https ESTABLISHED`, and `2607:6bc0::10` / `160.79.104.10` do
+resolve to `api.anthropic.com`) — entirely bypassing `ANTHROPIC_BASE_URL`. This connection is
+made even with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` set, i.e. native itself treats it as
+essential, not something this plugin can suppress. Whatever native sends/receives on that
+connection is what decides org verification for the static-token path, and it never touches
+`admission.py` or any other code in this repo — there is no header, route, or proxy behavior in
+this plugin that has any visibility into or influence over it. The keychain-session path does
+not hit this same failure (confirmed working through the identical relay, same run), so
+whatever native carries in its keychain-backed session (vs. a bare portable
+`claude setup-token` bearer value) is what that hardcoded connection is actually checking.
+
+**Status: not fixable in this plugin.** The enforcement point is inside the closed-source
+`claude` binary and is deliberately not redirectable via `ANTHROPIC_BASE_URL` — reading or
+altering what it decides would require TLS-intercepting that connection (a fake root CA
+terminating native's traffic to the real API), which is a different thing entirely from a code
+fix and was deliberately not attempted here. **Do not spend more time trying to make the
+static-token path pass this check** — five independent angles (token validity, CLI version,
+header fidelity, HTTP protocol/connection handling, request-header parity) were each ruled out
+live, and the actual decision point is outside this repo's reach.
+
+**Resolution taken:** blanked `CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN` back to empty in
+`~/.hermes/.env`, reverting this provider to the keychain/`CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR`
+session (confirmed working, `hermes -z ... --cli` -> `"Hey there, friend!"`, 2/2 live runs). This
+reopens the exact refresh-token-rotation/family-revocation risk the static token was added
+(2026-09-27) to avoid — accepted as the only currently-working option for this login. If that
+rotation problem recurs, the fix is re-establishing the keychain session
+(`claude auth login` under `CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR`), not re-populating the
+static token — it will not survive this redirect regardless of how it's minted.
+
+## Fork-only fix — 2026-10-02 (the static-token path CAN survive the `ANTHROPIC_BASE_URL` redirect; the 2026-09-28 "not fixable" finding is superseded)
+
+**Symptom:** identical to the 2026-09-28 finding — `CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN` fails
+with "Unable to verify organization ... token could not be validated" on an enterprise-org-pinned
+machine (managed `forceLoginOrgUUID`) while the keychain session works.
+
+**What was actually happening (live isolation on the pinned machine, 2026-10-02):** the pin makes
+native org-validate an env token through `POST https://api.anthropic.com/api/oauth/validate` before
+inference. That call succeeds with no `ANTHROPIC_BASE_URL`, with an explicit
+`ANTHROPIC_BASE_URL=https://api.anthropic.com`, and through an `HTTPS_PROXY` CONNECT tunnel — it is
+answered 403 only when the configured base URL is non-first-party, including our loopback relay
+(a transparent passthrough forwarding to the real API reproduces it; the CLI's `--debug-file` trace
+ends with `Failed to validate OAuth token ... Request failed with status code 403`). Native's
+first-party predicate is `base URL unset, or host == api.anthropic.com`; the relay URL fails it and
+the org check fails closed. The 2026-09-28 conclusion ("enforcement point not redirectable") was
+wrong: nothing about the request depends on the base URL — the classification does, and Claude Code
+exposes an internal override for it (`_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`, read by the
+predicate before any other rule).
+
+**Fix:** `directsdk.py`, `Client._run()`: `env['_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL'] = '1'`
+for the native spawn. The pin stays enforced — with a bogus token the pinned machine still fails
+closed through the relay (`Failed to validate OAuth token ... 401` ⇒ the org message); a revoked
+token still reads as revoked. The override is internal/underscored and version-sensitive: re-verify
+on Claude Code upgrades (verified on 2.1.283 and 2.1.284).
+
+**Do not use `ANTHROPIC_UNIX_SOCKET` for this** — the bundle shows the org validator returns valid
+*before* any validate call when that variable is set, i.e. it disables the control on a managed
+machine rather than satisfying it.
+
+**Verification:** scratch-config live matrix on the pinned machine (no base URL / explicit
+anthropic.com / loopback passthrough / loopback + override) plus a bogus-token fail-closed control;
+`tests/test_directsdk.py::test_static_token_path_keeps_first_party_classification` pins the child
+env.

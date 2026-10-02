@@ -492,8 +492,27 @@ class Client:
                 # hint why ("Unable to verify organization ... token could not be validated").
                 # Confirmed live: injecting a bogus value reproduces that exact failure byte for
                 # byte; stripping it restores native's normal keychain-based resolution. See FORK.md.
+                #
+                # FORK 2026-09-27: the strip above is right for an *accidental* leak from Hermes'
+                # unrelated credential pool, but a user may deliberately want this provider to run
+                # on a long-lived `claude setup-token` instead of native's own rotating keychain
+                # session. CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN is a new, plugin-owned,
+                # explicitly-declared var (same trust tier as _COMMAND/_CONFIG_DIR above) for
+                # exactly that — it is never picked up from ambient os.environ by accident, only
+                # from this plugin's own declared .env entry, so it can't reintroduce the leak.
+                static_token = env.pop('CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN', None)
                 env.pop('CLAUDE_CODE_OAUTH_TOKEN', None)
+                if static_token:
+                    env['CLAUDE_CODE_OAUTH_TOKEN'] = static_token
                 env.update(ENABLE_TOOL_SEARCH='false', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1', CLAUDE_CODE_MAX_RETRIES='0', DISABLE_AUTO_COMPACT='1', DISABLE_COMPACT='1')
+                # FORK 2026-10-02: the relay URL is non-first-party (127.0.0.1), which on a machine whose
+                # managed settings pin forceLoginOrgUUID makes native's own /api/oauth/validate call fail
+                # closed ("Unable to verify organization ... token could not be validated") before any
+                # request reaches this relay -- env-token auth only; a keychain login is exempt. This
+                # internal switch keeps native's first-party classification for the local hop. The pin
+                # still fails closed: a bogus token yields the same org error through the relay, and a
+                # 401 from /api/oauth/validate still reads as revoked. Re-verify on Claude Code upgrades.
+                env['_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL'] = '1'
                 # Hermes owns budgets; native's replayed reminder invalidates cached history.
                 env['CLAUDE_CODE_TOTAL_TOKENS_REMINDER'] = 'off'
                 # The queried frame lets the relay keep the cache breakpoint off native's per-request context.

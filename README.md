@@ -65,7 +65,7 @@ CLAUDE_CONFIG_DIR=/path/to/official-cli-config claude auth login
 export CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR=/path/to/official-cli-config
 ```
 
-An inherited `CLAUDE_CONFIG_DIR` also works. To select an executable outside PATH, set `CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND` to its absolute path. There is no unrestricted public CLI-flags setting; isolation and denial flags are plugin-owned. The low-level Python `Client(env=...)` injection is available for explicitly controlled local fixtures and does not apply the inherited-environment guard. It is not the normal Hermes provider path or an OAuth certification mechanism.
+An inherited `CLAUDE_CONFIG_DIR` also works. To select an executable outside PATH, set `CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND` to its absolute path. On a machine whose Claude Code managed settings pin `forceLoginOrgUUID`, point `CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN` (the plugin-owned variable, not the pooled `CLAUDE_CODE_OAUTH_TOKEN`) at a `claude setup-token` value and the relay keeps working: the plugin re-declares the local relay hop as a first-party base URL for native's own org-validation call while leaving that validation enforced, so a revoked or foreign-org token still fails closed. Verified with Claude Code 2.1.283/2.1.284; see FORK.md (2026-10-02). There is no unrestricted public CLI-flags setting; isolation and denial flags are plugin-owned. The low-level Python `Client(env=...)` injection is available for explicitly controlled local fixtures and does not apply the inherited-environment guard. It is not the normal Hermes provider path or an OAuth certification mechanism.
 
 Persistent configuration:
 

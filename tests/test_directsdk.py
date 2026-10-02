@@ -37,6 +37,8 @@ if os.environ.get('HANG'):
  print(json.dumps({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'started'}}}),flush=True)
  time.sleep(60)
 settings=json.loads(pathlib.Path(sys.argv[sys.argv.index('--settings')+1]).read_text())
+if os.environ.get('ENV_PROBE'):
+ open(os.environ['ENV_PROBE'],'w').write(json.dumps({k: v for k, v in os.environ.items() if k.startswith('CLAUDE') or k.startswith('ANTHROPIC') or '_FIRST_PARTY' in k}))
 wire=json.loads(settings['env']['CLAUDE_CODE_EXTRA_BODY'])
 assert wire['tools'][0]['description'].endswith('TAIL')
 assert '--max-turns' in sys.argv and sys.argv[sys.argv.index('--max-turns')+1]=='1'
@@ -170,6 +172,35 @@ class Contract(unittest.TestCase):
                 msg["content"] = "middleware changed"
                 self.assertEqual(client.chat.completions.create(**req).choices[0].message.content, "done")
             client.close()
+
+    def test_static_token_path_keeps_first_party_classification(self):
+        """The relay URL must stay first-party for native's org check, and only the plugin-owned
+        token may be re-declared as CLAUDE_CODE_OAUTH_TOKEN for the child (FORK.md 2026-10-02)."""
+        import directsdk
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "env.json"
+            base = dict(HOME=tmp, ENV_PROBE=str(probe), CLAUDE_CODE_OAUTH_TOKEN="sk-ant-pooled-leak", PATH=os.environ["PATH"])
+            client = self.client(tmp, CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN="sk-ant-static", **base)
+            client.chat.completions.create(**self.request(), stream=False)
+            seen = json.loads(probe.read_text())
+            self.assertNotIn("CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN", seen)
+            self.assertEqual(seen.get("CLAUDE_CODE_OAUTH_TOKEN"), "sk-ant-static")
+            self.assertEqual(seen.get("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"), "1")
+            client.close()
+            # Without the plugin-owned token the pooled var is still stripped and the override stays.
+            plain = self.client(tmp, ENV_PROBE=str(probe), CLAUDE_CODE_OAUTH_TOKEN="sk-ant-pooled-leak", PATH=os.environ["PATH"])
+            plain.chat.completions.create(**self.request(), stream=False)
+            seen = json.loads(probe.read_text())
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", seen)
+            self.assertEqual(seen.get("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"), "1")
+            plain.close()
+            # A caller-supplied env dict is the explicit fixture path: it wins over the plugin defaults.
+            raw = directsdk.Client(
+                command=[sys.executable, str(Path(tmp) / "native.py")],
+                env={"PATH": os.environ["PATH"], "HOME": tmp},
+            )
+            raw.chat.completions.create(**self.request(), stream=False)
+            raw.close()
 
     def test_logged_out_native_raises_the_login_hint(self):
         import directsdk
