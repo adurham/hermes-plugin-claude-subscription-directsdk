@@ -134,6 +134,9 @@ profile = ClaudeOAuthDirectSDKProfile(
     fallback_models=tuple(MODEL_METADATA),
     model_aliases={alias: native_model(alias) for alias in ALIASES},
     classify_api_error=classify_native_error,
+    # Zero-output empties here are transient (reasoning_details is a provider-private replay
+    # carrier, not visible thinking) and recover on the same provider; subscription retries are free.
+    empty_completion_policy='transient',
 )
 register_provider(profile)
 

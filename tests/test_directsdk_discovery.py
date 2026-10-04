@@ -21,6 +21,11 @@ def test_installed_plugin_registers_and_constructs_client_without_native_process
         client.close()
 
 
+def test_empty_completions_are_declared_transient(profile):
+    # Core retries same-provider and defers fallback only when the profile declares this.
+    assert profile.empty_completion_policy == "transient"
+
+
 def test_missing_claude_is_reported_on_every_path(profile, tmp_path, caplog):
     """No `claude` binary: setup says so, the picker degrades to the catalog, a request refuses with
     the install hint instead of a Popen traceback, and plugin load logged a warning."""
