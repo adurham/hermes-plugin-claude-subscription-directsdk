@@ -430,3 +430,32 @@ machine rather than satisfying it.
 anthropic.com / loopback passthrough / loopback + override) plus a bogus-token fail-closed control;
 `tests/test_directsdk.py::test_static_token_path_keeps_first_party_classification` pins the child
 env.
+
+## Fork-only fix — 2026-10-05 (the 2026-09-25 disconnect suppression never actually ran; moved to where socketserver calls it)
+
+**Symptom:** the 2026-09-25 traceback dump was still printing verbatim — same `'-'*40` block,
+same chained `_passthrough` → `send_error(502)` → `BrokenPipeError` traceback — observed again
+live in a CLI session on the personal mac (screenshot, 2026-10-05).
+
+**Root cause:** the 2026-09-25 fix overrode `Handler.handle_error()`, but socketserver never
+calls a `BaseHTTPRequestHandler` method for this path. `socketserver._handle_request_noblock`
+catches the handler's exception and calls `self.handle_error(request, client_address)` where
+`self` is the **server** (`HTTPServer` → `socketserver.BaseServer.handle_error`) — the default
+traceback printer. `handle_error` is not among the methods `BaseHTTPRequestHandler` delegates
+to the handler class, so the override was dead code and the terminal kept filling up. The
+2026-09-25 test passed anyway by timing luck: a plain `close()` leaves the first server-side
+write succeeding into the kernel buffer (no RST), so the repro didn't raise locally while the
+field did.
+
+**Fix:** `admission.py` — a `QuietHTTPServer(HTTPServer)` subclass carries the `handle_error`
+override (disconnect classes silent, anything else a one-line note, never a traceback dump);
+`Admission` constructs the server as `QuietHTTPServer`. The dead `Handler.handle_error`
+override is removed (it is the trap that made the first fix look done). `_passthrough`'s
+`except`-block `send_error(502)` is now best-effort (`except OSError: pass`) so a dead peer's
+second EPIPE can't escape to socketserver at all.
+
+**Verification:** `tests/test_directsdk_admission.py` — the disconnect test now forces an RST
+(`SO_LINGER(1, 0)`) so it reproduces deterministically, plus a new
+`test_server_handle_error_suppresses_disconnects_and_notes_the_rest` pinning the server-level
+behavior. Red on old code (2 failed, reproducing the field traceback exactly), green with the
+fix (9 passed).

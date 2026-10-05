@@ -125,6 +125,29 @@ class Capture:
         self.complete = bool(self.message and self.message.get('stop_reason') and not self.arguments)
 
 
+class QuietHTTPServer(HTTPServer):
+    """FORK 2026-10-05: socketserver dispatches a handler's exception to SERVER.handle_error
+    (socketserver.py `_handle_request_noblock` -> `self.handle_error`, where self is the server),
+    never to a BaseHTTPRequestHandler method -- which is why the 2026-09-25 suppression (an
+    override on Handler) never fired in the field and the traceback kept printing whenever
+    native hung up mid-proxy. The suppression must live here, the object socketserver calls.
+
+    Native opens one connection per request and hangs up as soon as it has what it needs; when it
+    does so while this relay is mid-proxy, the reply write raises BrokenPipeError/ConnectionResetError
+    out of the handler. The relay's own classification (status, capture, failure, denied) is what
+    callers read; a client disconnect is not worth a stack dump. Any OTHER exception still gets a
+    one-line note (the default socketserver dump is a full traceback)."""
+
+    admission: object = None  # set by Admission.__init__ after construction
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        name = type(exc).__name__ if exc else 'relay error'
+        print('claude-subscription-directsdk-experimental relay: ' + name, file=sys.stderr)
+
+
 class Admission:
     def __init__(self, upstream, timeout, queried=None):
         self.upstream = urlsplit(upstream)
@@ -148,7 +171,7 @@ class Admission:
         self.capture = Capture()
         self.error_body = b''
         self.prefix = '/admit/' + secrets.token_urlsafe(32)
-        self.server = HTTPServer(('127.0.0.1', 0), Handler)
+        self.server = QuietHTTPServer(('127.0.0.1', 0), Handler)
         self.server.admission = self
         self.url = f'http://127.0.0.1:{self.server.server_port}' + self.prefix
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval':.05}, daemon=True)
@@ -190,21 +213,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass  # Native authorization and the per-call route must never enter logs.
-
-    def handle_error(self, request, client_address):
-        """FORK: socketserver's default dumps a full traceback to stderr for ANY handler exception.
-
-        Native opens one connection per request and hangs up as soon as it has what it needs; when it
-        does so while this relay is mid-proxy, the reply write raises BrokenPipeError out of the
-        handler and the terminal the user is watching fills with socketserver's
-        ``'-'*40`` / ``Exception occurred during processing of request from ('127.0.0.1', ...)``
-        / two-traceback block (observed live). The relay's own classification (status, capture,
-        failure, denied) is what callers read; a client disconnect is not worth a stack dump.
-        """
-        exc = sys.exc_info()[1]
-        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
-            return
-        print('claude-subscription-directsdk-experimental relay: ' + type(exc).__name__ if exc else 'relay error', file=sys.stderr)
 
     def _passthrough(self):
         """Forward a request outside the gated /v1/messages route straight to the real upstream,
@@ -259,7 +267,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             self.close_connection = not keep_alive
         except (OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError):
-            self.send_error(502)
+            # FORK 2026-10-05: best-effort. When the client is already gone this write raises again
+            # (the field traceback: the 502 inside the except block EPIPEs a second time and escaped
+            # to socketserver); the peer needs nothing more -- never let reporting mask the outcome.
+            try:
+                self.send_error(502)
+            except OSError:
+                pass
             self.close_connection = True
         finally:
             if conn:

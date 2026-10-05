@@ -165,12 +165,18 @@ def test_client_disconnect_does_not_dump_a_traceback(capsys):
     """FORK: a native disconnect mid-proxy must not print socketserver's traceback.
 
     Native connects per request and hangs up as soon as it has what it needs. When that happens
-    while the relay is answering, the write raises BrokenPipeError out of the handler and
-    socketserver's default handle_error() dumps '-'*40 / 'Exception occurred during processing of
-    request from ...' / two tracebacks into the user's terminal (observed live on the corp box,
-    2026-09-25). The relay must stay silent for a client disconnect.
+    while the relay is answering, the write raises BrokenPipeError/ConnectionResetError out of the
+    handler and socketserver's default handle_error() dumps '-'*40 / 'Exception occurred during
+    processing of request from ...' / two tracebacks into the user's terminal (observed live,
+    2026-09-25 and again 2026-10-05). The relay must stay silent for a client disconnect.
+
+    FORK 2026-10-05: the socket is closed with SO_LINGER(1, 0) so the peer sends an RST instead of
+    a FIN -- a plain close() left the first write to succeed in the kernel buffer (timing luck: the
+    old test passed while the field kept printing), an RST makes the server-side write raise on the
+    next send, deterministically reproducing the field traceback.
     """
     import socket
+    import struct
     import time
     from http.client import HTTPConnection
     import admission
@@ -185,7 +191,8 @@ def test_client_disconnect_does_not_dump_a_traceback(capsys):
         conn.connect()
         conn.putrequest('HEAD', gate.prefix + '/api/hello')
         conn.endheaders()
-        conn.sock.close()  # native hung up; the relay's 502 now writes to a dead peer
+        conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        conn.sock.close()  # native hung up with an RST; the relay's 502 now writes to a dead peer
         end = time.monotonic() + 4
         while time.monotonic() < end:  # bounded: let the handler thread run and (pre-fix) print
             time.sleep(0.05)
@@ -193,4 +200,37 @@ def test_client_disconnect_does_not_dump_a_traceback(capsys):
         assert 'Traceback' not in err, err
         assert 'Exception occurred during processing of request' not in err, err
     finally:
+        gate.close()
+
+
+def test_server_handle_error_suppresses_disconnects_and_notes_the_rest(capsys):
+    """The suppression must live where socketserver calls it: SERVER.handle_error.
+
+    socketserver._handle_request_noblock dispatches a handler exception to self.handle_error (self
+    = the server). The pre-2026-10-05 override sat on the Handler class and therefore never ran;
+    this pins the server-level behavior directly: disconnect classes are silent, anything else is a
+    one-line note (never a traceback dump).
+    """
+    import admission
+    import socket as _socket
+    gate = admission.Admission('https://upstream.invalid', 5)
+    dummy = _socket.socket()
+    try:
+        capsys.readouterr()
+        for exc in (BrokenPipeError(32, 'Broken pipe'), ConnectionResetError(54, 'Connection reset by peer')):
+            try:
+                raise exc
+            except (BrokenPipeError, ConnectionResetError):
+                gate.server.handle_error(dummy, ('127.0.0.1', 41234))
+        err = capsys.readouterr().err
+        assert err == '', err
+        try:
+            raise ValueError('boom')
+        except ValueError:
+            gate.server.handle_error(dummy, ('127.0.0.1', 41234))
+        err = capsys.readouterr().err
+        assert 'ValueError' in err, err
+        assert 'Traceback' not in err, err
+    finally:
+        dummy.close()
         gate.close()
