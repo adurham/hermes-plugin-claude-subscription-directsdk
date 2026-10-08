@@ -452,3 +452,6 @@ Tests: `test_direct_call_to_a_deferred_tool_routes_through_the_tool_call_bridge`
 
 **Note:** a replay of `~/.hermes/sessions/request_dump_*.json` 400s on stale thinking signatures; strip
 `reasoning_details`/`reasoning_content` from the dumped messages first.
+
+**Landed:** `18e1e23` on `fork-main` (origin: `adurham/hermes-plugin-claude-subscription-directsdk`). Fork-only; not
+proposed upstream — it depends on the host's tool_search bridge (`tool_call`), which is a hermes-agent fork feature.
