@@ -430,3 +430,25 @@ machine rather than satisfying it.
 anthropic.com / loopback passthrough / loopback + override) plus a bogus-token fail-closed control;
 `tests/test_directsdk.py::test_static_token_path_keeps_first_party_classification` pins the child
 env.
+
+## Fork-only fix — 2026-10-08 (direct calls to deferred tools no longer fail the request)
+
+**Symptom:** "Native returned a tool outside the current host inventory" on every retry (3/3, again after
+`/retry`) mid-conversation, e.g. after the model had read case artifacts and wanted to look at screenshots.
+
+**Cause (reproduced live by replaying the dumped request, 1 in 3 runs):** the failing tool was
+`mcp__hermes__vision_analyze`. With host tool_search active, the `vision` toolset is in `defer_toolsets`,
+so the wire inventory carries only the `tool_search`/`tool_describe`/`tool_call` bridge — but the model knows
+`vision_analyze` by name (host prompts mention it) and calls it directly. `_run()` raised on any name not in
+the request's tool list; the failure is a deterministic function of the context, so the host's retries re-failed.
+
+**Fix:** `directsdk.py`, `Client._run()`: when native returns a `mcp__hermes__<name>` tool outside the
+inventory and `tool_call` IS in the inventory, rewrite the call (and the native block, so replayed history
+matches the advertised tools) to `tool_call {"calls":[{"name":<name>,"arguments":<input>}]}`. The host still
+validates scope/deferrability and returns a recoverable error for anything unreachable. Without a bridge in
+the inventory it still fails closed, and the error now names the offending tool.
+Tests: `test_direct_call_to_a_deferred_tool_routes_through_the_tool_call_bridge`,
+`test_unknown_tool_without_a_bridge_names_the_offender`.
+
+**Note:** a replay of `~/.hermes/sessions/request_dump_*.json` 400s on stale thinking signatures; strip
+`reasoning_details`/`reasoning_content` from the dumped messages first.

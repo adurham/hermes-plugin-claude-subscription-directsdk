@@ -649,8 +649,16 @@ class Client:
                 for block in blocks:
                     if block.get('type') == 'tool_use':
                         name = block['name']
+                        if name.startswith(PREFIX) and name[len(PREFIX):] not in names and 'tool_call' in names:
+                            # Host tool_search defers part of the catalog behind the `tool_call` bridge, but the model
+                            # knows those tools by name (e.g. `vision_analyze`) and calls them directly. Failing here
+                            # is deterministic, so the host's retries re-fail the same context 3/3. Route the call
+                            # through the bridge instead — the host re-validates scope and deferrability — and
+                            # rewrite the native block too so the replayed history matches the advertised inventory.
+                            block['input'] = {'calls': [{'name': name[len(PREFIX):], 'arguments': block['input']}]}
+                            block['name'] = name = PREFIX + 'tool_call'
                         if not name.startswith(PREFIX) or name[len(PREFIX):] not in names:
-                            raise RuntimeError('Native returned a tool outside the current host inventory')
+                            raise RuntimeError('Native returned a tool outside the current host inventory: ' + repr(name[:80]))
                         calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name[len(PREFIX):], 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and p.returncode == 1
                 if not boundary and not native_failure_handled and (p.returncode != 0 or final.get('is_error') or final.get('subtype') != 'success'):

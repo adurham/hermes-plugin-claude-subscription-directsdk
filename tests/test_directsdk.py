@@ -46,7 +46,7 @@ assert sys.argv[sys.argv.index('--permission-mode')+1]=='dontAsk'
 assert sys.argv[sys.argv.index('--tools')+1]==''
 assert rows[-1]['type']=='user'
 assert 'metadata' not in wire
-blocks=[{'type':'thinking','thinking':'private','signature':'signed-test'}, {'type':'text','text':'hello\n'}, {'type':'tool_use','id':'toolu_test','name':'mcp__hermes__probe','input':{'value':'x'}}]
+blocks=[{'type':'thinking','thinking':'private','signature':'signed-test'}, {'type':'text','text':'hello\n'}, {'type':'tool_use','id':'toolu_test','name':os.environ.get('TOOL_NAME','mcp__hermes__probe'),'input':{'value':'x'}}]
 if len(rows)>1:
  if rows[1]['message']['content'][0]['type']=='thinking':
   assert rows[1]['message']['content']==blocks
@@ -107,6 +107,22 @@ class Contract(unittest.TestCase):
                 }
             ],
         )
+
+    def test_direct_call_to_a_deferred_tool_routes_through_the_tool_call_bridge(self):
+        # The model knows deferred tools by name (e.g. vision_analyze) and calls them without the bridge.
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self.client(tmp, TOOL_NAME="mcp__hermes__vision_analyze")
+            req = self.request()
+            req["tools"].append({"type": "function", "function": {"name": "tool_call", "description": "bridge", "parameters": {"type": "object"}}})
+            call = client.chat.completions.create(**req).choices[0].message.tool_calls[0]
+            self.assertEqual(call.function.name, "tool_call")
+            self.assertEqual(json.loads(call.function.arguments), {"calls": [{"name": "vision_analyze", "arguments": {"value": "x"}}]})
+
+    def test_unknown_tool_without_a_bridge_names_the_offender(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self.client(tmp, TOOL_NAME="mcp__hermes__vision_analyze")
+            with self.assertRaisesRegex(RuntimeError, "outside the current host inventory: 'mcp__hermes__vision_analyze'"):
+                client.chat.completions.create(**self.request())
 
     def test_canonical_request_lifecycle(self):
         with tempfile.TemporaryDirectory() as tmp:
