@@ -2,7 +2,7 @@
 import codecs
 import copy
 import http.client
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
 import re
@@ -125,8 +125,17 @@ class Capture:
         self.complete = bool(self.message and self.message.get('stop_reason') and not self.arguments)
 
 
-class QuietHTTPServer(HTTPServer):
-    """FORK 2026-10-05: socketserver dispatches a handler's exception to SERVER.handle_error
+class QuietHTTPServer(ThreadingHTTPServer):
+    """FORK 2026-10-08: one thread per connection. Since the 2026-09-28 keep-alive fix, native's
+    /api/hello preflight connection stays open after its answer; a single-threaded server then sits
+    in that connection's handle() loop waiting for a next request, and a /v1/messages POST that
+    native opens on a NEW connection (it does whenever the preflight answer was not back before the
+    main request dispatched) is never accepted. Native reports that as "No response from API
+    (waited 3m)" -- the first-byte deadline, not the model -- and the relay then forwards the stale
+    POST upstream after native has already given up. Daemon threads and no join on close: an idle
+    keep-alive reader must never block Admission.close().
+
+    FORK 2026-10-05: socketserver dispatches a handler's exception to SERVER.handle_error
     (socketserver.py `_handle_request_noblock` -> `self.handle_error`, where self is the server),
     never to a BaseHTTPRequestHandler method -- which is why the 2026-09-25 suppression (an
     override on Handler) never fired in the field and the traceback kept printing whenever
@@ -139,6 +148,8 @@ class QuietHTTPServer(HTTPServer):
     one-line note (the default socketserver dump is a full traceback)."""
 
     admission: object = None  # set by Admission.__init__ after construction
+    daemon_threads = True
+    block_on_close = False
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]

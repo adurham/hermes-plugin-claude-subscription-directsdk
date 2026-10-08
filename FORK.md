@@ -459,3 +459,43 @@ second EPIPE can't escape to socketserver at all.
 `test_server_handle_error_suppresses_disconnects_and_notes_the_rest` pinning the server-level
 behavior. Red on old code (2 failed, reproducing the field traceback exactly), green with the
 fix (9 passed).
+
+
+## Fork-only fix — 2026-10-08 (the "No response from API (waited 3m)" failures were the relay, not the model or the timeout)
+
+**Symptom:** `Native API error: API Error: No response from API (waited 3m). If a proxy or gateway ...
+raise API_TIMEOUT_MS or CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS` — 89 failed attempts in agent.log
+(2026-10-05 → 2026-10-08, 78 on Opus 5.5), each falling through Hermes' 3 attempts into the
+glm fallback for some delegated children. A further ~52 calls "succeeded" at 180–240 s with almost
+no output: native's own single first-byte retry rescued them after a dead 3 minutes.
+
+**Data (agent.log + .1, 1247 successful Opus 5.5 calls):** clean single-attempt latency p50 9 s,
+p90 65 s, p99 182 s. Every failure was *followed by a success in ~5–10 s* (60 of 60 that had a
+next call; median 8 s incl. backoff) — the API was never stalled, a longer first-byte window would
+have rescued nothing. No correlation with context size (failures at in=19K–206K, median 109K, same
+as the overall median 120K). First failure 2026-10-05 14:33, after the 2026-10-04 merge (7c48576) brought the 2026-10-02
+keep-alive relay change into the installed checkout; zero in the ~2,200 calls logged 10-03/10-04.
+(The "156" grep count includes Hermes' paired "Retrying API call" lines; 89 distinct attempts.)
+
+**Root cause:** `admission.py`'s relay was a single-threaded `HTTPServer`. Since the 2026-09-28 /
+2026-10-02 keep-alive fix, the `/api/hello` preflight connection stays open after its answer; the
+server thread then blocks in that connection's `handle()` loop waiting for a next request. Native
+sends `/v1/messages` on the same connection when the preflight answer is already back, but on a
+**new** connection when it isn't (preflight and main request race). That new connection is never
+accepted until native's first-byte watchdog (180 s, `CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS` default)
+aborts and closes the idle preflight socket; only then does the relay forward the stale POST
+upstream. Reproduced against the real native binary + a loopback fake upstream: a 0.6 s
+`/api/hello` delay makes 4/4 calls fail with exactly this error (window shrunk to 10 s); 0 s delay
+→ 25/25 succeed. Raw-socket repro: POST on a second connection gets no headers while the first is
+open, and answers in 0.00 s the moment it closes.
+
+**Fix:** `QuietHTTPServer` derives from `ThreadingHTTPServer` (one daemon thread per connection,
+`block_on_close = False` so an idle keep-alive reader cannot hold `Admission.close()`). No timeout
+knob added: raising `CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS`/`API_TIMEOUT_MS` would only have made each
+dead attempt wait longer.
+
+**Verification:** new `test_messages_post_is_answered_while_a_preflight_keepalive_connection_is_still_open`
+(red on old code, green with fix; full plugin suite 41 passed). Native-binary probe with the slow
+preflight: 4/4 OK in 0.4 s. One live Opus 5.5 call (effort high) through `directsdk.Client()` on
+the host env path: `PONG` in 1.6 s, 1 upstream request, relay ThreadingHTTPServer. A >3 min
+silent-thinking phase was not reproduced (and is not what these failures were).

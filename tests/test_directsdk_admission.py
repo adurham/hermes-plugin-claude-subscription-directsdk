@@ -234,3 +234,48 @@ def test_server_handle_error_suppresses_disconnects_and_notes_the_rest(capsys):
     finally:
         dummy.close()
         gate.close()
+
+
+def test_messages_post_is_answered_while_a_preflight_keepalive_connection_is_still_open():
+    """Native opens /v1/messages on a NEW connection while its /api/hello keep-alive connection is
+    still open. The relay must answer that POST without waiting for the idle connection to close;
+    when it did not, native gave up with "No response from API (waited 3m)" (FORK.md 2026-10-08)."""
+    import socket
+    import admission
+
+    class Peer(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+        def log_message(self, *args):
+            pass
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            body = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    peer = ThreadingHTTPServer(('127.0.0.1', 0), Peer)
+    threading.Thread(target=peer.serve_forever, daemon=True).start()
+    gate = admission.Admission(f'http://127.0.0.1:{peer.server_port}', 30)
+    preflight = socket.create_connection(('127.0.0.1', gate.server.server_port), timeout=5)
+    messages = socket.create_connection(('127.0.0.1', gate.server.server_port), timeout=5)
+    try:
+        preflight.sendall(f'HEAD {gate.prefix}/api/hello HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n'.encode())
+        assert preflight.recv(4096).startswith(b'HTTP/1.1 200')
+        body = b'{}'
+        messages.sendall(f'POST {gate.prefix}/v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n'
+                         f'Content-Length: {len(body)}\r\n\r\n'.encode() + body)
+        assert messages.recv(4096).startswith(b'HTTP/1.1 200')  # socket.timeout here = the 3-minute stall
+        assert gate.status == 200
+    finally:
+        preflight.close()
+        messages.close()
+        gate.close()
+        peer.shutdown()
+        peer.server_close()
