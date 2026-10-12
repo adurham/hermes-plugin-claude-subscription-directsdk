@@ -455,3 +455,30 @@ Tests: `test_direct_call_to_a_deferred_tool_routes_through_the_tool_call_bridge`
 
 **Landed:** `18e1e23` on `fork-main` (origin: `adurham/hermes-plugin-claude-subscription-directsdk`). Fork-only; not
 proposed upstream — it depends on the host's tool_search bridge (`tool_call`), which is a hermes-agent fork feature.
+
+## Fork-only fix — 2026-10-12 (native's auto-attached `# userEmail` context made the model comment on the account email every turn)
+
+**Symptom:** replies kept announcing a "system-reminder block about your email address" in
+tool results and saying it was being ignored — noise on every turn.
+
+**Root cause:** Claude Code 2.1.x builds a per-request user context
+(`claudeMd`, `userEmail`, `currentDate`) and attaches it to the turn inside
+`<system-reminder>`. `userEmail` is emitted whenever the CLI is logged in (skipped only if
+`ANTHROPIC_UNIX_SOCKET` is set). Hermes turns don't need it, and the model treated it as
+suspicious injected text. No CLI flag or env var disables it short of the socket variable,
+which changes API routing.
+
+**Fix:** `admission.py` gains `strip_email_context()`, run in the relay's `do_POST` before
+`pin_message_breakpoint()`. It removes only the `# userEmail` section (regex over message
+text blocks); other blocks, `cache_control` and unparseable payloads are untouched. Because
+the strip happens on every request, replayed history stays byte-identical, so the cache
+prefix is unaffected.
+
+**Files:** `admission.py`, `tests/test_admission_breakpoint.py`, `FORK.md`.
+
+**Verification:** new regression test plus the existing 15 admission/breakpoint tests pass
+(run from `~/repos/hermes-agent` with `.venv/bin/python`, `PYTHONPATH=.`). Not yet confirmed
+on a live turn after restart.
+
+**Merge note:** upstream-worthy only if upstream wants the email hidden; if a later CLI
+rewords the section the regex simply stops matching (fails open).

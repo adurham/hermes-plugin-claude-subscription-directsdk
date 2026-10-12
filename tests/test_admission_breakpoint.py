@@ -72,3 +72,16 @@ def test_breakpoint_moves_to_the_last_block_hermes_itself_sent(queried, messages
 ])
 def test_stable_breakpoint_or_nothing_to_anchor_forwards_unchanged(payload, queried):
     assert pin_message_breakpoint(payload, queried) == payload
+
+
+def test_email_context_section_is_stripped_and_nothing_else_changes():
+    from admission import strip_email_context
+    text = ("<system-reminder>\n# userEmail\nThe user's email address is a@b.com. Use it only.\n"
+            "# currentDate\nToday's date is 1.\n</system-reminder>")
+    raw = wire([{'role': 'user', 'content': [{'type': 'text', 'text': text, 'cache_control': MARKER}]}])
+    out = json.loads(strip_email_context(raw))['messages'][0]['content'][0]
+    assert 'a@b.com' not in out['text'] and 'userEmail' not in out['text']
+    assert "# currentDate\nToday's date is 1." in out['text'] and out['cache_control'] == MARKER
+    clean = wire([{'role': 'user', 'content': [QUESTION]}])
+    assert strip_email_context(clean) == clean
+    assert strip_email_context(b'userEmail not json') == b'userEmail not json'

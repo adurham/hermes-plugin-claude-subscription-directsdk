@@ -21,6 +21,37 @@ def _plain(block):
     return {k: v for k, v in block.items() if k != 'cache_control'} if isinstance(block, dict) else block
 
 
+_EMAIL_CONTEXT = re.compile(r"# userEmail\r?\nThe user's email address is [^\n]*\n?")
+
+
+def strip_email_context(payload):
+    """Drop native's auto-attached ``# userEmail`` context section from message text blocks.
+
+    The account email is not needed for a Hermes turn and the model otherwise comments on it.
+    Only that section is removed (cache_control and other blocks are untouched); any payload
+    that does not parse, or has no such section, forwards as is."""
+    if b"userEmail" not in payload:
+        return payload
+    try:
+        body = json.loads(payload)
+        changed = False
+        for m in body['messages']:
+            content = m.get('content')
+            if not isinstance(content, list):
+                continue
+            for b in content:
+                if isinstance(b, dict) and b.get('type') == 'text' and isinstance(b.get('text'), str):
+                    new = _EMAIL_CONTEXT.sub('', b['text'])
+                    if new != b['text']:
+                        b['text'] = new
+                        changed = True
+        if not changed:
+            return payload
+        return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return payload
+
+
 def pin_message_breakpoint(payload, queried):
     """Keep the single message ``cache_control`` on content the next request replays unchanged.
 
@@ -298,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.connection.settimeout(gate.timeout)
             payload = self.rfile.read(int(self.headers['Content-Length']))
-            payload = pin_message_breakpoint(payload, gate.queried)
+            payload = pin_message_breakpoint(strip_email_context(payload), gate.queried)
             target = gate.upstream
             if target.scheme == 'https':
                 conn = http.client.HTTPSConnection(target.hostname, target.port, timeout=gate.timeout, context=ssl.create_default_context())
