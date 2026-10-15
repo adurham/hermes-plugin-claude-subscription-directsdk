@@ -499,3 +499,24 @@ dead attempt wait longer.
 preflight: 4/4 OK in 0.4 s. One live Opus 5.5 call (effort high) through `directsdk.Client()` on
 the host env path: `PONG` in 1.6 s, 1 upstream request, relay ThreadingHTTPServer. A >3 min
 silent-thinking phase was not reproduced (and is not what these failures were).
+
+## Fork-only fix — 2026-10-15 (a tool name outside the inventory failed the whole turn: "Native returned a tool outside the current host inventory")
+
+**Symptom:** turns died after 3/3 retries with `RuntimeError: Native returned a tool outside the
+current host inventory` (seen in `errors.log` since at least 2026-10-02, on Opus 5.5 and Sonnet 5.5;
+hit a long-running multi-PR session on 2026-10-15). Retrying never helps: the same history makes the
+model emit the same call.
+
+**Root cause:** the model called a tool that is not in the current tool list (typically one recalled
+from earlier context after the inventory changed). `_run` validated every `tool_use` block against the
+request's `names` set and raised, turning a *model* mistake into a *provider* failure.
+
+**Fix:** `_run` no longer raises. It strips the `mcp__hermes__` prefix if present and forwards the
+call; Hermes' own unknown-tool handling answers `Tool 'X' does not exist. Available tools: ...` and
+the model self-corrects. Safe: native tools are disabled (`--tools ''`), MCP callbacks are inert and
+denied by `dontAsk`, and Hermes rejects names outside its registry, so nothing executes via the plugin.
+
+**Verification:** new `test_unknown_tool_name_is_forwarded_not_a_provider_failure` (the fake native
+now honors a `TOOL_NAME` env override). Not run green in a full suite: the repo venv lacks
+`hermes_yaml`, so 15 tests error (and 2 fail) identically with and without this change; 25 pass with
+it vs 24 before. Requires a Hermes restart to load.
