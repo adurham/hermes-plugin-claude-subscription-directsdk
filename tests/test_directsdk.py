@@ -46,7 +46,7 @@ assert sys.argv[sys.argv.index('--permission-mode')+1]=='dontAsk'
 assert sys.argv[sys.argv.index('--tools')+1]==''
 assert rows[-1]['type']=='user'
 assert 'metadata' not in wire
-blocks=[{'type':'thinking','thinking':'private','signature':'signed-test'}, {'type':'text','text':'hello\n'}, {'type':'tool_use','id':'toolu_test','name':'mcp__hermes__probe','input':{'value':'x'}}]
+blocks=[{'type':'thinking','thinking':'private','signature':'signed-test'}, {'type':'text','text':'hello\n'}, {'type':'tool_use','id':'toolu_test','name':os.environ.get('TOOL_NAME','mcp__hermes__probe'),'input':{'value':'x'}}]
 if len(rows)>1:
  if rows[1]['message']['content'][0]['type']=='thinking':
   assert rows[1]['message']['content']==blocks
@@ -222,6 +222,17 @@ class Contract(unittest.TestCase):
                 other.chat.completions.create(**self.request())
             self.assertNotIsInstance(raised.exception, directsdk.ClaudeCodeLoggedOut)
             other.close()
+
+    def test_unknown_tool_name_is_forwarded_not_a_provider_failure(self):
+        # A stale/hallucinated tool name must reach Hermes (which answers "Tool X does not exist")
+        # instead of failing the turn and burning all retries.
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self.client(tmp, TOOL_NAME="mcp__hermes__gone_tool")
+            req = self.request()
+            req["timeout"] = SimpleNamespace(read=10)
+            result = client.chat.completions.create(**req, stream=False)
+            calls = result.choices[0].message.tool_calls
+            self.assertEqual([c["function"]["name"] if isinstance(c, dict) else c.function.name for c in calls], ["gone_tool"])
 
     def test_fail_closed_and_cancellation(self):
         import directsdk

@@ -649,9 +649,13 @@ class Client:
                 for block in blocks:
                     if block.get('type') == 'tool_use':
                         name = block['name']
-                        if not name.startswith(PREFIX) or name[len(PREFIX):] not in names:
-                            raise RuntimeError('Native returned a tool outside the current host inventory')
-                        calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name[len(PREFIX):], 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
+                        # A hallucinated/stale tool name (model recalls a tool from earlier context that is no longer in the
+                        # inventory) is a model mistake, not a provider failure. Forward it so Hermes' own unknown-tool handling
+                        # answers "Tool X does not exist. Available tools: ..." and the model self-corrects, instead of
+                        # failing the whole turn (and all retries, since the same history reproduces it).
+                        # It is never executed here: native tools are disabled and Hermes rejects names outside its registry.
+                        bare = name[len(PREFIX):] if name.startswith(PREFIX) else name
+                        calls.append({'id': block['id'], 'type': 'function', 'function': {'name': bare, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and p.returncode == 1
                 if not boundary and not native_failure_handled and (p.returncode != 0 or final.get('is_error') or final.get('subtype') != 'success'):
                     raise RuntimeError('Native request failed: ' + str(final.get('subtype')) + stderr_suffix())
