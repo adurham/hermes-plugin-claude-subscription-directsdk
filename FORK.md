@@ -10,6 +10,36 @@ dated entry here (symptom, root cause, fix, verification). Push to `origin`
 (this fork) only — never to `upstream` (NousResearch) without opening a PR
 there deliberately.
 
+## Fork-only feature — 2026-11-04 (account usage hook: the subscription plan's own windows)
+
+**Symptom.** A Desktop chat manually switched from Nous to this provider kept the
+status bar on `Nous Portal · Week 100% → claude-subscription-directsdk-experimental`.
+The owner asked for his Claude usage on that session; Hermes had no way to read it,
+because this provider exposed no account-usage hook (core's Anthropic fetcher reads
+`CLAUDE_CODE_OAUTH_TOKEN`, which this provider deliberately ignores as another
+account's pooled credential).
+
+**Root cause.** `ProviderProfile.fetch_account_usage` was not implemented, so
+`agent.account_usage.fetch_account_usage('claude-subscription-directsdk-experimental')`
+returned None and the statusbar's plan gauge had nothing for this provider.
+
+**Fix.** `ClaudeOAuthDirectSDKProfile.fetch_account_usage` fetches
+`https://api.anthropic.com/api/oauth/usage` with the plugin's OWN
+`CLAUDE_SUBSCRIPTION_DIRECTSDK_OAUTH_TOKEN` (read from the plugin env, process env
+winning) and returns the five-hour session, seven-day, Opus-week and Sonnet-week
+windows in core's `AccountUsageSnapshot` shape (model-scoped for the last two), plus
+the billed `extra_usage` line. `utilization` is scaled only when ≤ 1, matching core's
+`_usage_windows(fraction=True)`. A 429 sets a module-wide cooldown from `retry-after`
+(default 900 s, floor 60 s) and is honoured before any request — the endpoint
+rate-limits hard, and the picker/statusbar refresh cadence is 2 minutes.
+
+**Tests.** `tests/test_usage.py`: fraction/percent parsing and window scopes,
+429 cooldown with no re-request, no token → no request.
+
+**Verified.** 3/3 under `HERMES_AGENT_REPO=~/repos/hermes-agent` with the dev
+checkout's pytest. The live endpoint answered 429 with `retry-after: 899` during
+the session (proof the token is accepted, not 401); the parser is covered offline.
+
 ## Fork-only fix — 2026-09-25 (native stderr was discarded; every startup/preflight failure looked identical)
 
 **Symptom:** every failure mode of the native `claude` subprocess — a bad
