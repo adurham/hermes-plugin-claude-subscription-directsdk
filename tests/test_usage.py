@@ -8,6 +8,7 @@ rate-limited endpoint every refresh tick.
 """
 import importlib.util
 import json
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -56,6 +57,12 @@ def plugin(monkeypatch):
     monkeypatch.setattr(module, "_usage_token", lambda: "sk-ant-oat-test-token")
     module._usage_retry_at = 0.0
     return module
+
+
+@pytest.fixture(autouse=True)
+def _isolated_hermes_home(tmp_path, monkeypatch):
+    """No test may read the machine's real relay capture: that would answer for every fetch."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
 
 def _install(monkeypatch, response):
@@ -118,3 +125,86 @@ def test_no_token_means_no_request(monkeypatch, plugin):
     monkeypatch.setattr("httpx.Client", lambda **_kw: pytest.fail("no token must not call the endpoint"))
 
     assert plugin._fetch_subscription_usage() is None
+
+
+def _write_capture(root, payload):
+    path = root / "cache" / "claude-subscription-directsdk" / "unified-limits.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+@pytest.fixture()
+def headers_home(tmp_path, monkeypatch):
+    """A private HERMES_HOME: the relay writes there, the hook reads the same path."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    return tmp_path
+
+
+def test_inference_headers_paint_the_own_allowance_without_any_request(headers_home, plugin, monkeypatch):
+    # The setup token is inference-only: `GET /api/oauth/usage` 403s. But every inference reply
+    # carries the account's own 5h/weekly figures, and the relay captures them — so the gauge can
+    # show THIS session's Claude numbers with no network call and no profile-scoped credential.
+    reset_5h = int((datetime.now(UTC) + timedelta(hours=2)).timestamp())
+    reset_7d = int((datetime.now(UTC) + timedelta(days=4)).timestamp())
+    _write_capture(headers_home, {
+        "captured_at": 1_800_000_000.0,
+        "5h-utilization": "0.65", "5h-reset": str(reset_5h),
+        "7d-utilization": "0.18", "7d-reset": str(reset_7d),
+        "overage-status": "rejected", "overage-disabled-reason": "out_of_credits",
+    })
+    monkeypatch.setattr(plugin, "_usage_token", lambda: "")
+    monkeypatch.setattr("httpx.Client", lambda **_kw: pytest.fail("captured headers must not hit the network"))
+
+    snapshot = plugin._fetch_subscription_usage()
+
+    assert snapshot is not None
+    assert snapshot.source == "native_rate_limit_headers"
+    assert [(w.label, w.used_percent, w.scope) for w in snapshot.windows] == [
+        ("Current session", 65.0, "account"),
+        ("Current week", 18.0, "account"),
+    ]
+    assert snapshot.details == ("Extra usage: not available (out of credits)",)
+
+
+def test_a_header_window_whose_reset_passed_is_dropped(headers_home, plugin):
+    past = int((datetime.now(UTC) - timedelta(minutes=5)).timestamp())
+    future = int((datetime.now(UTC) + timedelta(days=4)).timestamp())
+    _write_capture(headers_home, {
+        "5h-utilization": "0.99", "5h-reset": str(past),
+        "7d-utilization": "0.18", "7d-reset": str(future),
+    })
+
+    snapshot = plugin._fetch_subscription_usage()
+
+    assert snapshot is not None
+    assert [(w.label, w.used_percent) for w in snapshot.windows] == [("Current week", 18.0)]
+
+
+def test_the_relay_records_the_unified_headers(headers_home):
+    sys.path.insert(0, str(REPO_ROOT))
+    sys.modules.pop("admission", None)
+    import admission
+
+    admission._last_rate_limit = {}
+    headers = [
+        ("Content-Type", "text/event-stream"),
+        ("anthropic-ratelimit-unified-5h-utilization", "0.42"),
+        ("anthropic-ratelimit-unified-5h-reset", "1793829600"),
+    ]
+    admission.capture_rate_limits(headers)
+
+    path = admission.rate_limit_state_path()
+    assert path == headers_home / "cache" / "claude-subscription-directsdk" / "unified-limits.json"
+    assert json.loads(path.read_text())["5h-utilization"] == "0.42"
+
+    # The same observation on the next reply is not rewritten...
+    before = path.stat().st_mtime_ns
+    admission.capture_rate_limits(headers)
+    assert path.stat().st_mtime_ns == before
+
+    # ...a changed one is, and a reply without unified headers leaves it alone.
+    admission.capture_rate_limits([("anthropic-ratelimit-unified-5h-utilization", "0.43")])
+    assert json.loads(path.read_text())["5h-utilization"] == "0.43"
+    admission.capture_rate_limits([("Server", "cloudflare")])
+    assert json.loads(path.read_text())["5h-utilization"] == "0.43"

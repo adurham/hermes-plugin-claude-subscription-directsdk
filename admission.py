@@ -5,16 +5,78 @@ import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import os
+import pathlib
 import re
 import secrets
 import socket
 import ssl
 import sys
 import threading
+import time
 from urllib.parse import urlsplit
 
 
 UNCACHEABLE = ('thinking', 'redacted_thinking')
+
+
+# --- Subscription usage capture (fork 2026-11-04) -------------------------------------------
+# Anthropic stamps every inference reply with the account's own subscription windows:
+# `anthropic-ratelimit-unified-5h-utilization` / `-5h-reset` / `-7d-utilization` / `-7d-reset`
+# (epoch seconds), plus the overage state. Those are readable with the inference-only
+# `claude setup-token` this provider runs on — which is NOT true of ``GET /api/oauth/usage``:
+# that endpoint requires ``user:profile`` and answers 403 ``oauth_scope_insufficient`` for a
+# setup token (measured on this account 2026-11-04). This relay is the only place Hermes sees
+# the inference reply, so it records the observation in one small file that the provider's
+# ``fetch_account_usage`` reads; the statusbar then paints the Claude allowance THIS session
+# draws on, instead of hiding the gauge or borrowing another account's plan.
+RATE_LIMIT_PREFIX = 'anthropic-ratelimit-unified-'
+rate_limit_lock = threading.Lock()
+_last_rate_limit: dict = {}
+
+
+def rate_limit_state_path() -> pathlib.Path:
+    """Where the newest observation lands.
+
+    ``HERMES_HOME`` so every reader (the gateway, a turn's worker, the model picker) resolves
+    the same file; the home fallback keeps a flat module import usable in tests.
+    """
+    home = os.environ.get('HERMES_HOME') or str(pathlib.Path.home() / '.hermes')
+    return pathlib.Path(home) / 'cache' / 'claude-subscription-directsdk' / 'unified-limits.json'
+
+
+def capture_rate_limits(headers) -> None:
+    """Record one reply's ``anthropic-ratelimit-unified-*`` headers. Best-effort, never raises.
+
+    Written only when the observation changed — every reply repeats the same figures until
+    another turn is billed — and atomically, so a reader never sees half a file.
+    """
+    observed = {}
+    for key, value in headers:
+        low = key.lower()
+        if low.startswith(RATE_LIMIT_PREFIX):
+            observed[low[len(RATE_LIMIT_PREFIX):]] = str(value)
+    if not observed:
+        return
+    global _last_rate_limit
+    with rate_limit_lock:
+        if observed == _last_rate_limit:
+            return
+        _last_rate_limit = observed
+        path = rate_limit_state_path()
+        staging = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            staging = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+            staging.write_text(json.dumps({'captured_at': time.time(), **observed}), encoding='utf-8')
+            os.replace(staging, path)
+        except OSError:
+            if staging is not None:
+                try:
+                    staging.unlink()
+                except OSError:
+                    pass
+
 
 
 def _plain(block):
@@ -342,6 +404,9 @@ class Handler(BaseHTTPRequestHandler):
             conn.request('POST', route, payload, headers)
             del headers, payload
             response = conn.getresponse()
+            # The account's own 5h/weekly window figures ride every inference reply; this relay
+            # is the only place they are visible (see capture_rate_limits).
+            capture_rate_limits(response.getheaders())
             gate.request_id = response.getheader('request-id') or response.getheader('x-request-id')
             gate.status = response.status
             self.send_response(response.status)

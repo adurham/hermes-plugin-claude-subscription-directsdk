@@ -1,5 +1,6 @@
 """Claude Subscription DirectSDK (Experimental) — standalone Hermes model-provider registration."""
 import logging
+import json
 import math
 import os
 import time
@@ -97,7 +98,10 @@ def _usage_reset(value):
         elif isinstance(value, str) and value.strip():
             text = value.strip()
             text = text[:-1] + "+00:00" if text.endswith("Z") else text
-            reset = datetime.fromisoformat(text)
+            # The inference headers carry epoch SECONDS as a decimal string (`1793829600`);
+            # the JSON endpoint carries ISO. Accept either, in one place.
+            reset = (datetime.fromtimestamp(float(text), tz=UTC) if text.replace(".", "", 1).isdigit()
+                     else datetime.fromisoformat(text))
             reset = reset if reset.tzinfo else reset.replace(tzinfo=UTC)
         else:
             return None
@@ -129,6 +133,62 @@ def _usage_window(payload, key: str, label: str, *, scope: str = "account"):
                               scope=scope)
 
 
+_USAGE_SOURCE_HEADERS = "native_rate_limit_headers"
+
+
+def _header_window(payload, key, label):
+    """One ``<key>-utilization`` / ``<key>-reset`` header pair → an account window, or None."""
+    used = payload.get(f"{key}-utilization")
+    try:
+        used = float(used)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(used) or used < 0:
+        return None
+    if used <= 1:
+        used *= 100
+    reset = _usage_reset(payload.get(f"{key}-reset"))
+    if reset is None or reset <= datetime.now(UTC):
+        return None
+    from agent.account_usage import AccountUsageWindow
+
+    return AccountUsageWindow(label=label, used_percent=used, reset_at=reset, scope="account")
+
+
+def _captured_subscription_usage():
+    """The relay's newest ``anthropic-ratelimit-unified-*`` observation → (windows, details), or None.
+
+    Every inference reply carries the account's own 5h/weekly figures — the same numbers the
+    Claude Code ``/usage`` screen shows — and they are readable with the setup token this provider
+    runs on, unlike ``GET /api/oauth/usage`` (which requires ``user:profile`` and 403s). The relay
+    records them per reply; this reads the newest one and drops any window whose reset has passed,
+    so an idle account never shows a window that no longer describes it.
+    """
+    try:
+        from .admission import rate_limit_state_path
+    except ImportError:
+        from admission import rate_limit_state_path
+    try:
+        payload = json.loads(rate_limit_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    windows = [window for window in (
+        _header_window(payload, "5h", "Current session"),
+        _header_window(payload, "7d", "Current week"),
+    ) if window is not None]
+    if not windows:
+        return None
+    details = []
+    reason = str(payload.get("overage-disabled-reason") or "").strip().replace("_", " ")
+    if reason:
+        details.append(f"Extra usage: not available ({reason})")
+    elif str(payload.get("overage-status") or "").strip() == "rejected":
+        details.append("Extra usage: not available")
+    return windows, details
+
+
 def _fetch_subscription_usage():
     """The account's 5h/weekly allowance from the OAuth usage endpoint, or None.
 
@@ -137,6 +197,22 @@ def _fetch_subscription_usage():
     rate limit into a request storm.
     """
     global _usage_retry_at
+    # The relay's header capture is free, needs no network, and works with the inference-only
+    # setup token this provider runs on — so it wins whenever a turn has been billed. Checked
+    # before the endpoint cooldown: a 403 from `/api/oauth/usage` must not hide a number we
+    # already have.
+    captured = _captured_subscription_usage()
+    if captured is not None:
+        from agent.account_usage import AccountUsageSnapshot
+
+        windows, details = captured
+        # `fetched_at` is now, and that is honest here: utilization only moves when a turn is
+        # billed, the relay rewrites the observation on every reply, and each window is dropped
+        # once its own reset passes. So the newest observation IS the account's position until
+        # the next request — not a number ageing out in a cache.
+        return AccountUsageSnapshot(
+            provider="claude-subscription-directsdk-experimental", source=_USAGE_SOURCE_HEADERS,
+            fetched_at=datetime.now(UTC), windows=tuple(windows), details=tuple(details))
     if time.monotonic() < _usage_retry_at:
         return None
     token = _usage_token()

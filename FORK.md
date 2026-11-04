@@ -10,6 +10,53 @@ dated entry here (symptom, root cause, fix, verification). Push to `origin`
 (this fork) only — never to `upstream` (NousResearch) without opening a PR
 there deliberately.
 
+## Fork-only feature — 2026-11-04 (b) (the windows also ride every inference reply, so the gauge can show them)
+
+**Supersedes the last paragraph of the entry below.** That entry concluded this account could not read
+its Claude allowance at all, because `GET /api/oauth/usage` refuses a `claude setup-token` with
+`403 permission_error: OAuth token does not meet scope requirement user:profile`. That is true of that
+endpoint only. Anthropic also stamps **every inference reply** with the same numbers:
+
+```
+anthropic-ratelimit-unified-5h-utilization: 0.65
+anthropic-ratelimit-unified-5h-reset: 1793829600
+anthropic-ratelimit-unified-7d-utilization: 0.18
+anthropic-ratelimit-unified-7d-reset: 1793908800
+anthropic-ratelimit-unified-overage-status: rejected
+anthropic-ratelimit-unified-overage-disabled-reason: out_of_credits
+```
+
+and those are readable with the inference-only setup token (live probe through this plugin's own
+relay: HTTP 200, headers as above). The relay in `admission.py` is the only place Hermes sees that
+reply, so it records them.
+
+**Fix.**
+- `admission.py`: `capture_rate_limits(response.getheaders())` on the gated `/v1/messages` reply —
+  keeps every `anthropic-ratelimit-unified-*` header, writes them atomically (temp + `os.replace`)
+  to `$HERMES_HOME/cache/claude-subscription-directsdk/unified-limits.json` only when the
+  observation changed. Best-effort: any `OSError` is swallowed (a usage readout must never affect
+  a turn). `rate_limit_state_path()` resolves the same path for every process, so a worker's turn
+  and the gateway's statusbar read the same observation.
+- `__init__.py`: `_captured_subscription_usage()` reads that file → `(windows, details)`;
+  `_fetch_subscription_usage` returns a `native_rate_limit_headers` snapshot from it **before** the
+  endpoint path and before the 403 cooldown, so a scope refusal can no longer hide a number the
+  relay already has. Windows are the account-scoped `Current session` (5h) and `Current week` (7d);
+  a window whose reset has passed is dropped. `_usage_reset` now accepts epoch seconds as a decimal
+  string (the headers' shape) as well as ISO.
+- `fetched_at` is stamped now when serving the capture: utilization only moves when a turn is
+  billed and the relay rewrites the observation on every reply, so the newest observation is the
+  account's current position until the next request (the window resets bound it).
+
+**Verified.** `tests/test_usage.py` 7/7 (three new: header snapshot with no network and no token,
+expired-window drop, relay capture writes/dedupes the file). Live through the real
+`admission.Admission` against `api.anthropic.com`: one 1-token reply → state file with
+`5h-utilization 0.65`, `7d-utilization 0.18`, both resets, overage `out_of_credits`. End to end
+without network: `profile.fetch_account_usage()` → `source=native_rate_limit_headers`, windows
+`[('Current session', 65.0, 'account'), ('Current week', 18.0, 'account')]`; after
+`remember_account_usage`, `gateway.session_usage._account_window_gauge()` returns
+`{'id': 'session', 'used_bp': 6500, 'resets_at_ms': ..., 'provider': 'claude-subscription-directsdk-experimental'}`
+— i.e. `Claude Subscription · Current session 65%`, the binding window.
+
 ## Fork-only feature — 2026-11-04 (account usage hook: the subscription plan's own windows)
 
 **Symptom.** A Desktop chat manually switched from Nous to this provider kept the
@@ -46,7 +93,9 @@ user:profile (oauth_scope_insufficient)`. So the account's own setup token can
 fetch INFERENCE but not the usage block; this hook returns None until the provider
 runs on a credential with `user:profile` (an interactive `claude auth login`, which
 this machine does not have), and the Desktop plan chip correctly hides instead of
-showing another account's plan.
+showing another account's plan. **(Superseded by 2026-11-04 (b): the same windows ride every
+inference reply as `anthropic-ratelimit-unified-*` headers, which the relay now captures — the
+chip shows this account's Claude numbers with the setup token.)**
 
 ## Fork-only fix — 2026-09-25 (native stderr was discarded; every startup/preflight failure looked identical)
 
