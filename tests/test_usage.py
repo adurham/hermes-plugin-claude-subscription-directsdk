@@ -98,6 +98,21 @@ def test_a_429_sets_a_cooldown_and_is_not_retried(monkeypatch, plugin):
     assert plugin._fetch_subscription_usage() is None
 
 
+def test_a_scope_error_rests_the_endpoint(monkeypatch, plugin):
+    # `claude setup-token` mints a `user:inference` token; the usage endpoint requires
+    # `user:profile` and refuses with 403. Asking again two minutes later cannot change that.
+    _install(monkeypatch, _Response(403, {
+        "type": "error",
+        "error": {"type": "permission_error", "message": "OAuth token does not meet scope requirement user:profile"},
+    }))
+
+    assert plugin._fetch_subscription_usage() is None
+    assert plugin._usage_retry_at > 0
+
+    monkeypatch.setattr("httpx.Client", lambda **_kw: pytest.fail("must not re-request a scope refusal"))
+    assert plugin._fetch_subscription_usage() is None
+
+
 def test_no_token_means_no_request(monkeypatch, plugin):
     monkeypatch.setattr(plugin, "_usage_token", lambda: "")
     monkeypatch.setattr("httpx.Client", lambda **_kw: pytest.fail("no token must not call the endpoint"))

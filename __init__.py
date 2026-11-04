@@ -23,10 +23,14 @@ logger = logging.getLogger(__name__)
 # The claude.ai /usage block: the 5-hour session and the weekly caps, plus billed extra usage.
 # Same account and the same numbers the Claude Code `/usage` screen shows, not a token estimate.
 _USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-# Anthropic rate-limits this endpoint hard (a `retry-after` in the many hundreds of seconds is
-# routine). A 429 without a usable header backs off for this long — never re-ask on the 2-minute
+# A 429 without a usable header backs off for this long — never re-ask on the 2-minute
 # picker/statusbar refresh cadence, which would just earn another 429.
 _USAGE_RETRY_DEFAULT_S = 900.0
+# A setup token (`claude setup-token`) carries `user:inference` only; the usage endpoint requires
+# `user:profile` and answers 403. That cannot change without another login, so do not re-probe on
+# every refresh. Measured on this account 2026-11-04: "OAuth token does not meet scope requirement
+# user:profile" (error_code=oauth_scope_insufficient).
+_USAGE_SCOPE_RETRY_S = 3600.0
 # A reset further ahead than this is a bad stamp, not a real window (the longest is a week).
 _USAGE_RESET_MAX_AHEAD_S = 8 * 86_400
 _usage_retry_at = 0.0
@@ -163,6 +167,13 @@ def _fetch_subscription_usage():
             delay = _USAGE_RETRY_DEFAULT_S
         _usage_retry_at = time.monotonic() + max(delay, 60.0)
         logger.debug("Claude subscription usage: rate limited; retry in %.0fs", max(delay, 60.0))
+        return None
+    if response.status_code in (401, 403):
+        # 403 = the setup token lacks `user:profile`; 401 = a dead token. Neither heals by asking
+        # again within the picker's 2-minute refresh, so rest the endpoint for an hour.
+        _usage_retry_at = time.monotonic() + _USAGE_SCOPE_RETRY_S
+        logger.debug("Claude subscription usage: HTTP %s (token scope/permission); resting for %.0fs",
+                     response.status_code, _USAGE_SCOPE_RETRY_S)
         return None
     if response.status_code != 200:
         return None

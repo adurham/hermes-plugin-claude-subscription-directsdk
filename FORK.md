@@ -30,15 +30,23 @@ winning) and returns the five-hour session, seven-day, Opus-week and Sonnet-week
 windows in core's `AccountUsageSnapshot` shape (model-scoped for the last two), plus
 the billed `extra_usage` line. `utilization` is scaled only when ≤ 1, matching core's
 `_usage_windows(fraction=True)`. A 429 sets a module-wide cooldown from `retry-after`
-(default 900 s, floor 60 s) and is honoured before any request — the endpoint
-rate-limits hard, and the picker/statusbar refresh cadence is 2 minutes.
+(default 900 s, floor 60 s); a 401/403 rests the endpoint for an hour. Both are
+honoured before any request — the endpoint rate-limits hard, and a setup token's
+scope cannot change between two-minute refreshes.
 
 **Tests.** `tests/test_usage.py`: fraction/percent parsing and window scopes,
-429 cooldown with no re-request, no token → no request.
+429 cooldown with no re-request, 403 scope refusal rests the endpoint, no token →
+no request.
 
-**Verified.** 3/3 under `HERMES_AGENT_REPO=~/repos/hermes-agent` with the dev
-checkout's pytest. The live endpoint answered 429 with `retry-after: 899` during
-the session (proof the token is accepted, not 401); the parser is covered offline.
+**Verified.** 4/4 under `HERMES_AGENT_REPO=~/repos/hermes-agent` with the dev
+checkout's pytest. Live probe of the endpoint with this plugin's own token
+(2026-11-04): first `429 retry-after: 899` (the token is accepted, not 401), then
+after the window `403 permission_error: OAuth token does not meet scope requirement
+user:profile (oauth_scope_insufficient)`. So the account's own setup token can
+fetch INFERENCE but not the usage block; this hook returns None until the provider
+runs on a credential with `user:profile` (an interactive `claude auth login`, which
+this machine does not have), and the Desktop plan chip correctly hides instead of
+showing another account's plan.
 
 ## Fork-only fix — 2026-09-25 (native stderr was discarded; every startup/preflight failure looked identical)
 
